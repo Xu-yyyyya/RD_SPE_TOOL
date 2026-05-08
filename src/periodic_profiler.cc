@@ -1,11 +1,16 @@
 #include <string.h>
 #include <iostream>
 #include <unistd.h>
+/**
+ * @file periodic_profiler.cc
+ * @brief 实现周期性 profiler 的事件选择与后台分段逻辑。
+ */
+
 #include "periodic_profiler.hh"
 #include "clock.hh"
 #include "pthread_hook.hh"
 
-// Use output of bin/list_events to find event names on current architecture
+/** @brief 不同架构下事件名依赖本机 `bin/list_events` 的输出。 */
 
 #if defined(__x86_64__)
 static const char *EVENT_NAME[] = {
@@ -107,6 +112,9 @@ static const char *PF_EVENTS[] = {
 };
 const event_spec pf_counters = {4, PF_EVENTS, EVENT_LEADER};
 
+/**
+ * @brief 根据运行模式返回普通计数器规格。
+ */
 static event_spec get_counters(int sample_period, perp_mode mode)
 {
     switch (mode) {
@@ -118,6 +126,9 @@ static event_spec get_counters(int sample_period, perp_mode mode)
     }
 }
 
+/**
+ * @brief 根据运行模式返回采样事件规格。
+ */
 static event_spec get_samplers(int sample_period, perp_mode mode)
 {
     switch (mode) {
@@ -143,16 +154,20 @@ PeriodicProfiler::PeriodicProfiler(const char *profile_name, int sample_period, 
     _mon.set_nonstop();
 }
 
+/** @brief 停止后台线程并结束最后一个采样窗口。 */
 PeriodicProfiler::~PeriodicProfiler()
 {
     _stop_thread = true;
     _thread.join();
 }
 
+/**
+ * @brief 周期性切分 `Monitor` 采样窗口。
+ *
+ * 该线程每秒执行一次 stop/start，使输出天然带有时间片边界。
+ */
 void PeriodicProfiler::run_thread()
 {
-    //每隔 1 秒周期性地“停止并重新启动”监控器 Monitor，把采样划分成连续的时间片/阶段，
-    //便于统计分段指标和刷新底层 perf 计数/缓冲区；每次重启使用当前的阶段标签 _tag。
     std::cerr << "==============================PeriodicProfiler run thread :"<<gettid()<<"================"<<std::endl;
     const auto period = std::chrono::seconds(1);
 
@@ -170,6 +185,7 @@ void PeriodicProfiler::run_thread()
     _mon.stop();
 }
 
+/** @brief 打开一个带显式标签的逻辑阶段。 */
 void PeriodicProfiler::kernel_start(const char *tag)
 {
     char pt[strlen(tag)+2];
@@ -179,6 +195,7 @@ void PeriodicProfiler::kernel_start(const char *tag)
     _tag.assign(tag);
 }
 
+/** @brief 关闭当前逻辑阶段并恢复到默认标签。 */
 void PeriodicProfiler::kernel_stop()
 {
     char pt[_tag.size()+2];

@@ -1,8 +1,16 @@
 #include <algorithm>
 #include <dirent.h>
+/**
+ * @file threads.cc
+ * @brief 实现进程内线程枚举辅助函数。
+ */
+
 #include "threads.hh"
 #include "rd_exception.hh"
 
+/**
+ * @brief 从 `/proc/self/task` 枚举当前进程的线程 ID。
+ */
 std::vector<int> get_threads(int ignored)
 {
     DIR *dir = opendir("/proc/self/task");

@@ -1,7 +1,15 @@
 #include <time.h>
+/**
+ * @file clock.cc
+ * @brief 实现项目内部统一使用的单调时钟读取函数。
+ */
+
 #include "clock.hh"
 #include "rd_exception.hh"
 
+/**
+ * @brief 读取 `CLOCK_MONOTONIC_RAW` 并转换为纳秒时间戳。
+ */
 unsigned long nano_clock()
 {
     timespec time, res;

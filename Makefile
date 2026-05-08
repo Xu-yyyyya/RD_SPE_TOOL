@@ -15,11 +15,17 @@ LIB_OBJECTS := $(patsubst %.cc,%.o,$(wildcard $(SRCDIR)/*.cc))
 DEPS = $(LIB_OBJECTS:%.o=%.d)
 
 CXX=g++
-override CXXFLAGS+= -fopenmp -fPIC -O2 -Wall -std=c++14 -g -I./include  -MMD
+override CXXFLAGS+= -fopenmp -fPIC -O2 -Wall -std=c++14 -g -I./include -MMD
 CFLAGS = -O2 -Wall -g -MMD -I./include 
 LDLIBS=-lpfm -lnuma -ldl
 
 all: $(LIB) $(BIN)
+
+kernel-module:
+	$(MAKE) -C kernel
+
+kernel-clean:
+	$(MAKE) -C kernel clean
 
 $(TEST) bin/stream: $(DESTDIR)/librd.a
 
@@ -34,3 +40,4 @@ $(LIB): $(LIB_OBJECTS)
 
 clean:
 	-rm -rf $(DESTDIR) $(SRCDIR)/*.o $(SRCDIR)/*.d *~ $(BIN) $(BINDIR)/*.d
+	-$(MAKE) -C kernel clean

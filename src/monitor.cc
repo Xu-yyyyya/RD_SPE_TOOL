@@ -22,6 +22,11 @@
 #include "pthread_hook.hh"
 #include "rd_exception.hh"
 
+/**
+ * @file monitor.cc
+ * @brief 实现底层 perf/SPE 监控器、样本解码和热点导出逻辑。
+ */
+
 #define MB (1024*1024)
 #define PAGE_SIZE (sysconf(_SC_PAGESIZE))
 
@@ -40,6 +45,7 @@ struct read_format {
     uint64_t time_running;
 };
 
+/** @brief 读取一个 perf fd 的 value/time_enabled/time_running。 */
 static read_format read_fd(int fd)
 {
     read_format count = {};
@@ -49,6 +55,7 @@ static read_format read_fd(int fd)
     return count;
 }
 
+/** @brief 解析项目支持的 ARM SPE 事件名字。 */
 uint64_t parse_arm_spe_event(const char* event_name)
 {
     if (!strncmp(event_name, "ARM_SPE:LOAD", 13))
@@ -60,21 +67,30 @@ uint64_t parse_arm_spe_event(const char* event_name)
     return 0;
 }
 
+/** @brief 判断一个 SPE packet 是否是短格式地址包。 */
 static bool is_arm_spe_address_packet(uint8_t header)
 {
     return (header & SPE_PACKET_ADDRESS_MASK) == SPE_PACKET_ADDRESS_HEADER;
 }
 
+/** @brief 取出短格式地址包中的 index 字段。 */
 static uint8_t arm_spe_short_index(uint8_t header)
 {
     return header & SPE_PACKET_SHORT_INDEX_MASK;
 }
 
+/** @brief 取出地址 payload 的低 56 位。 */
 static uint64_t arm_spe_addr_get_bytes_0_6(uint64_t payload)
 {
     return payload & ((1ULL << SPE_ADDR_PKT_BYTE7_SHIFT) - 1);
 }
 
+/**
+ * @brief 根据地址包类型还原 ARM SPE 中记录的地址值。
+ *
+ * 指令地址与数据虚拟地址的清洗规则不同，这里沿用 perf 解码器的
+ * 语义：指令地址需要保留高位上下文，数据虚拟地址只取低 56 位。
+ */
 static uint64_t decode_arm_spe_address_payload(int index, uint64_t payload)
 {
     if (index == SPE_ADDR_PKT_HDR_INDEX_INS ||
@@ -96,6 +112,7 @@ static uint64_t decode_arm_spe_address_payload(int index, uint64_t payload)
     return payload;
 }
 
+/** @brief 去除一行文本前导空白。 */
 static std::string trim_ascii_space(const std::string& s)
 {
     size_t pos = 0;
@@ -104,6 +121,7 @@ static std::string trim_ascii_space(const std::string& s)
     return s.substr(pos);
 }
 
+/** @brief 尽量把绝对路径规范化为真实路径。 */
 static std::string normalize_filesystem_path(const std::string& path)
 {
     if (path.empty() || path[0] != '/')
@@ -115,6 +133,7 @@ static std::string normalize_filesystem_path(const std::string& path)
     return path;
 }
 
+/** @brief 读取当前进程主二进制路径。 */
 static std::string read_self_exe_path()
 {
     char path_buf[PATH_MAX];
@@ -125,6 +144,7 @@ static std::string read_self_exe_path()
     return normalize_filesystem_path(path_buf);
 }
 
+/** @brief 读取线程最近一次运行所在 CPU。 */
 static int read_thread_last_cpu_stat(int tid)
 {
     char path[128];
@@ -159,6 +179,7 @@ static int read_thread_last_cpu_stat(int tid)
     return cpu;
 }
 
+/** @brief 判断一组 sampler 事件中是否包含 ARM SPE。 */
 int has_arm_spe_event(const char **event_names, const int num_samplers)
 {
     int val = 0;
@@ -170,6 +191,11 @@ int has_arm_spe_event(const char **event_names, const int num_samplers)
     return val;
 }
 
+/**
+ * @brief 初始化一个 perf event 属性对象。
+ *
+ * 该函数统一处理普通 counter、普通 sample 和 ARM SPE 三种路径。
+ */
 perf_event_attr init_perf_attr(const char *event_name, bool per_thread, uint64_t sample_period)
 {
     perf_event_attr attr = {};
@@ -227,6 +253,7 @@ perf_event_attr init_perf_attr(const char *event_name, bool per_thread, uint64_t
     return attr;
 }
 
+/** @brief 按事件规格批量打开一组 perf fd。 */
 void open_fds(int pid, bool per_thread, int cpu, const event_spec spec, uint64_t sample_period, int *fds)
 {
     int group_fd = -1;
@@ -252,6 +279,7 @@ void open_fds(int pid, bool per_thread, int cpu, const event_spec spec, uint64_t
     }
 }
 
+/** @brief 构造监控器并接入当前进程已有线程。 */
 Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, uint64_t sample_period,
     int ringbufsize, int auxbufsize, const char *name, bool is_pin)
     : _num_counters(counter_spec.n)
@@ -273,6 +301,17 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
     , _hotspot_top_k(DEFAULT_HOTSPOT_TOP_K)
     , _hotspot_unmapped_samples(0)
 {
+    const char *env_hotspot_top_k = getenv("RD_HOTSPOT_TOP_K");
+
+    if (env_hotspot_top_k && *env_hotspot_top_k) {
+        char *end = nullptr;
+        unsigned long value = strtoul(env_hotspot_top_k, &end, 10);
+
+        if (!end || *end != '\0' || value == 0)
+            throw RdException("RD_HOTSPOT_TOP_K must be a positive integer");
+        _hotspot_top_k = (size_t)value;
+    }
+
     char fn[128];
     snprintf(fn, sizeof(fn), "%s.info", name);
     _nameprefix = name;
@@ -332,26 +371,31 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
               << _num_samplers << " samplers/thread" << std::endl;
 }
 
+/** @brief 判断 sampler 规格是否走 ARM SPE 格式。 */
 bool Monitor::has_arm_spe_samples() const
 {
     return has_arm_spe_event(_sampler_spec.event_name, _num_samplers) != 0;
 }
 
+/** @brief 返回单条样本记录的字节数。 */
 size_t Monitor::sample_record_bytes() const
 {
     return has_arm_spe_samples() ? sizeof(uint64_t) * 3 : sizeof(uint64_t) * 2;
 }
 
+/** @brief 返回当前样本记录的字段顺序描述。 */
 const char *Monitor::sample_record_fields() const
 {
     return has_arm_spe_samples() ? "addr,time,pc" : "time,addr";
 }
 
+/** @brief 判断样本记录中是否显式携带 PC。 */
 bool Monitor::sample_pc_present() const
 {
     return has_arm_spe_samples();
 }
 
+/** @brief 以去重方式记住一次可执行模块映射。 */
 void Monitor::remember_module_map(uint64_t vm_start, uint64_t vm_end, uint64_t file_offset, const std::string& path)
 {
     const std::string effective_path = path.empty() ? "[anonymous_exec]" : normalize_filesystem_path(path);
@@ -372,12 +416,14 @@ void Monitor::remember_module_map(uint64_t vm_start, uint64_t vm_end, uint64_t f
     _module_maps.push_back(entry);
 }
 
+/** @brief 记录当前运行的主二进制路径。 */
 void Monitor::snapshot_main_binary_path()
 {
     if (_main_binary_path.empty())
         _main_binary_path = read_self_exe_path();
 }
 
+/** @brief 抓取 `/proc/self/maps` 中所有可执行映射，供热点 PC 离线解释使用。 */
 void Monitor::snapshot_module_maps()
 {
     if (!sample_pc_present())
@@ -414,6 +460,7 @@ void Monitor::snapshot_module_maps()
     }
 }
 
+/** @brief 通过绝对 PC 查找所属模块映射。 */
 const module_map_entry *Monitor::find_module_map(uint64_t pc) const
 {
     for (const auto& entry : _module_maps) {
@@ -423,11 +470,13 @@ const module_map_entry *Monitor::find_module_map(uint64_t pc) const
     return nullptr;
 }
 
+/** @brief 判断一条模块映射是否属于当前主二进制。 */
 bool Monitor::is_main_binary_module(const module_map_entry& entry) const
 {
     return !_main_binary_path.empty() && entry.path == _main_binary_path;
 }
 
+/** @brief 记录一次热点 PC 样本，并按“模块 + offset”归并。 */
 void Monitor::record_hotspot_sample(int tid, uint64_t pc)
 {
     if (!sample_pc_present() || tid <= 0 || pc == 0)
@@ -447,6 +496,7 @@ void Monitor::record_hotspot_sample(int tid, uint64_t pc)
     _thread_hotspots[tid][key] += 1;
 }
 
+/** @brief 生成一个线程的热点摘要列表，并按热度排序。 */
 std::vector<hotspot_summary> Monitor::collect_hotspots_for_thread(int tid) const
 {
     std::vector<hotspot_summary> summaries;
@@ -482,6 +532,7 @@ std::vector<hotspot_summary> Monitor::collect_hotspots_for_thread(int tid) const
     return summaries;
 }
 
+/** @brief 把热点摘要写出为独立 `.hotpc` manifest。 */
 void Monitor::write_hotspot_manifest() const
 {
     if (!sample_pc_present())
@@ -498,7 +549,6 @@ void Monitor::write_hotspot_manifest() const
     for (int tid : _tids)
         hotspot_count += collect_hotspots_for_thread(tid).size();
 
-    out << "hotpc_manifest_version=1" << std::endl;
     out << "hotspot_top_k=" << _hotspot_top_k << std::endl;
     out << "hotspot_identity=module_offset" << std::endl;
     out << "hotspot_scope=main_binary_only" << std::endl;
@@ -523,6 +573,7 @@ void Monitor::write_hotspot_manifest() const
     }
 }
 
+/** @brief 写出 `.info` 文件，作为本次运行的元数据总清单。 */
 void Monitor::write_info(std::ofstream& info)
 {
     int max_cmdline = 256;
@@ -553,7 +604,6 @@ void Monitor::write_info(std::ofstream& info)
 
     if (sample_pc_present()) {
         info << "pc_identity=raw_va" << std::endl;
-        info << "module_map_version=1" << std::endl;
         info << "module_map_fields=module_id,path,vm_start,vm_end,file_offset" << std::endl;
         info << "module_map_count=" << _module_maps.size() << std::endl;
         for (const auto& entry : _module_maps) {
@@ -686,11 +736,13 @@ void Monitor::write_info(std::ofstream& info)
     }
 }
 
+/** @brief 记录一个阶段标记。 */
 void Monitor::mark_phase(const char *tag)
 {
     _phases.push_back({tag, nano_clock()});
 }
 
+/** @brief 析构时停止后台线程、回收资源并落盘所有结果。 */
 Monitor::~Monitor()
 {
     if (_event_fd != -1) {
@@ -743,6 +795,7 @@ Monitor::~Monitor()
     std::cerr << "Monitor::~Monitor done" << std::endl;
 }
 
+/** @brief 在持锁状态下查找线程状态。 */
 thread_state *Monitor::find_thread_locked(int tid)
 {
     auto it = _threads.find(tid);
@@ -751,6 +804,7 @@ thread_state *Monitor::find_thread_locked(int tid)
     return &it->second;
 }
 
+/** @brief 在持锁状态下注册指定线程。 */
 thread_state& Monitor::register_thread_locked(int tid)
 {
     thread_state& state = _threads[tid];
@@ -770,6 +824,12 @@ thread_state& Monitor::register_thread_locked(int tid)
     return state;
 }
 
+/**
+ * @brief 为一个线程打开 counter/sampler fd 并建立映射。
+ *
+ * sampler 路径会创建 per-thread writer，并把每个 sampler slot 注册到
+ * epoll 监听集合中。
+ */
 void Monitor::open_thread_locked(thread_state& state)
 {
     if (_is_pin) {
@@ -877,6 +937,7 @@ void Monitor::open_thread_locked(thread_state& state)
     }
 }
 
+/** @brief enable 一个线程上的全部 perf 事件。 */
 void Monitor::enable_thread_locked(thread_state& state)
 {
     for (int fd : state.counter_fds) {
@@ -889,6 +950,7 @@ void Monitor::enable_thread_locked(thread_state& state)
     }
 }
 
+/** @brief disable 一个线程上的全部 perf 事件。 */
 void Monitor::disable_thread_locked(thread_state& state)
 {
     for (int fd : state.counter_fds) {
@@ -901,6 +963,7 @@ void Monitor::disable_thread_locked(thread_state& state)
     }
 }
 
+/** @brief 把即将退役线程的累计 perf 计数合并入全局退役计数。 */
 void Monitor::accumulate_retired_counts_locked(const thread_state& state)
 {
     for (int counter = 0; counter < _num_counters; counter++) {
@@ -923,6 +986,7 @@ void Monitor::accumulate_retired_counts_locked(const thread_state& state)
     }
 }
 
+/** @brief 关闭并回收一个线程上的所有 perf fd 与映射。 */
 void Monitor::close_thread_locked(thread_state& state)
 {
     for (auto& slot : state.samplers) {
@@ -949,6 +1013,7 @@ void Monitor::close_thread_locked(thread_state& state)
     state.active = false;
 }
 
+/** @brief 在持锁状态下注销一个线程，并先 drain 再关闭。 */
 void Monitor::unregister_thread_locked(int tid)
 {
     thread_state *state = find_thread_locked(tid);
@@ -965,6 +1030,7 @@ void Monitor::unregister_thread_locked(int tid)
     close_thread_locked(*state);
 }
 
+/** @brief 注册当前线程，并在需要时立即 enable。 */
 void Monitor::register_current_thread()
 {
     if (_num_counters == 0 && _num_samplers == 0)
@@ -977,6 +1043,7 @@ void Monitor::register_current_thread()
         enable_thread_locked(state);
 }
 
+/** @brief 注销当前线程。 */
 void Monitor::unregister_current_thread()
 {
     if (_num_counters == 0 && _num_samplers == 0)
@@ -987,6 +1054,11 @@ void Monitor::unregister_current_thread()
     unregister_thread_locked(tid);
 }
 
+/**
+ * @brief 后台 sampler 线程。
+ *
+ * 它负责等待 epoll 事件，并在收到 eventfd 指令时执行全量 drain。
+ */
 void Monitor::run_sampler_thread()
 {
     int64_t tid = gettid();
@@ -1038,6 +1110,7 @@ drain:
     }
 }
 
+/** @brief 通过 slot ID 路由到真正的 sampler slot 处理函数。 */
 size_t Monitor::process_samples(int slot_id)
 {
     std::lock_guard<std::mutex> lock(_state_mutex);
@@ -1047,6 +1120,13 @@ size_t Monitor::process_samples(int slot_id)
     return process_samples_locked(*it->second);
 }
 
+/**
+ * @brief drain 一个 sampler slot 上的 ring/AUX 数据。
+ *
+ * 普通 `PERF_RECORD_SAMPLE` 直接写出 `time,addr`；
+ * ARM SPE `PERF_RECORD_AUX` 则逐 packet 解码，并在 `time + data VA + pc`
+ * 三元组齐备时写出 `addr,time,pc`。
+ */
 size_t Monitor::process_samples_locked(sampler_slot& slot)
 {
     perf_event_mmap_page *buf_header = (perf_event_mmap_page *)slot.ringbuf;
@@ -1243,6 +1323,7 @@ size_t Monitor::process_samples_locked(sampler_slot& slot)
     return num_samples;
 }
 
+/** @brief 对所有活跃 fd 批量执行指定 ioctl。 */
 void Monitor::fds_ioctl(int request)
 {
     std::lock_guard<std::mutex> lock(_state_mutex);
@@ -1260,11 +1341,13 @@ void Monitor::fds_ioctl(int request)
     }
 }
 
+/** @brief 对所有 perf fd 执行 reset。 */
 void Monitor::reset()
 {
     fds_ioctl(PERF_EVENT_IOC_RESET);
 }
 
+/** @brief 打开一个新的采样窗口并在必要时启用所有事件。 */
 void Monitor::start(const char *tag, bool offloaded)
 {
     _kinfos.push_back({});
@@ -1302,6 +1385,7 @@ void Monitor::start(const char *tag, bool offloaded)
     }
 }
 
+/** @brief 关闭当前采样窗口、触发 drain 并汇总统计。 */
 void Monitor::stop()
 {
     if (!_nonstop_mode && _events_enabled) {
@@ -1334,6 +1418,7 @@ void Monitor::stop()
     read_counters(ki.counters, true);
 }
 
+/** @brief 读取所有活跃线程的计数，并与退役线程累计值合并。 */
 void Monitor::read_counters(counter_data *counters, bool include_samplers)
 {
     std::lock_guard<std::mutex> lock(_state_mutex);
@@ -1381,6 +1466,7 @@ void Monitor::read_counters(counter_data *counters, bool include_samplers)
     }
 }
 
+/** @brief 主动向后台线程发送一次 drain 请求。 */
 void Monitor::read_samples()
 {
     if (_event_fd == -1)
@@ -1390,16 +1476,19 @@ void Monitor::read_samples()
         throw RdException("eventfd write failed");
 }
 
+/** @brief 记录一段用户关心的地址区间。 */
 void Monitor::tag_addr(const char *tag, void *start, void *end)
 {
     _addr_tags.push_back({tag, start, end});
 }
 
+/** @brief 打开一个二进制输出文件。 */
 BinaryWriter::BinaryWriter(const char *path)
     : _ofs(path, std::ios::binary | std::ios::trunc)
 {
 }
 
+/** @brief 顺序写入一段原始二进制记录。 */
 void BinaryWriter::write(char *a, size_t n)
 {
     _ofs.write(a, n);
