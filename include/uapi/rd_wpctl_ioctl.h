@@ -12,6 +12,19 @@
 #define RD_WPCTL_DEVICE "/dev/rd_wpctl"
 #define RD_WPCTL_IOCTL_MAGIC 'R'
 #define RD_WPCTL_LOG2_BUCKETS 64
+#define RD_WPCTL_MAX_PAIR_HISTS 4096
+#define RD_WPCTL_MAX_CALLCHAIN_DEPTH 8
+#define RD_WPCTL_MAX_CONTEXTS 4096
+#define RD_WPCTL_MAX_DWARF_STACK_BYTES 8192
+
+/**
+ * @brief targeted_rd 调用上下文采集模式。
+ */
+enum rd_wpctl_callchain_mode {
+	RD_CALLCHAIN_OFF = 0,
+	RD_CALLCHAIN_FP = 1,
+	RD_CALLCHAIN_DWARF = 2,
+};
 
 /**
  * @brief AArch64 索引寄存器扩展方式。
@@ -61,8 +74,10 @@ struct rd_wpctl_target {
  */
 struct rd_wpctl_session_cfg {
 	__u32 wp_capacity;
-	__u32 reserved0;
+	__u32 callchain_mode;
 	__u64 bp_sample_period;
+	__u32 dwarf_stack_bytes;
+	__u32 dwarf_event_capacity;
 };
 
 /**
@@ -121,6 +136,19 @@ struct rd_wpctl_thread_stats {
     __u64 hits;
     __u64 evictions;
 	__u64 dropped;
+	__u32 pair_hist_used;
+	__u32 reserved1;
+	__u64 pair_hist_dropped;
+	__u32 context_used;
+	__u32 reserved2;
+	__u64 context_dropped;
+	__u64 callchain_failed;
+	__u64 callchain_truncated;
+	__u32 dwarf_event_used;
+	__u32 reserved3;
+	__u64 dwarf_event_dropped;
+	__u64 dwarf_stack_copy_failed;
+	__u64 dwarf_stack_bytes;
 };
 
 /**
@@ -130,6 +158,80 @@ struct rd_wpctl_hist_req {
 	__u32 thread_index;
 	__u32 target_index;
 	__u64 buckets[RD_WPCTL_LOG2_BUCKETS];
+};
+
+/**
+ * @brief 拉取某个线程的一条 use-reuse pair `log2` 直方图。
+ *
+ * key 为 `(seed_pc_offset, reuse_pc)`；`reuse_pc` 第一版保持为命中时
+ * 用户态 PC 的 raw virtual address，由后处理结合运行时映射解释。
+ */
+struct rd_wpctl_pair_hist_req {
+	__u32 thread_index;
+	__u32 entry_index;
+	__u8 used;
+	__u8 reserved0[7];
+	__u32 seed_context_id;
+	__u32 reuse_context_id;
+	__u64 seed_pc_offset;
+	__u64 reuse_pc;
+	__u64 buckets[RD_WPCTL_LOG2_BUCKETS];
+};
+
+/**
+ * @brief 拉取某个线程的一条调用上下文。
+ */
+struct rd_wpctl_context_req {
+	__u32 thread_index;
+	__u32 context_id;
+	__u8 used;
+	__u8 depth;
+	__u8 reserved0[6];
+	__u64 ips[RD_WPCTL_MAX_CALLCHAIN_DEPTH];
+};
+
+/**
+ * @brief DWARF 离线 unwind 所需的一次用户态寄存器和栈快照。
+ */
+struct rd_wpctl_dwarf_snapshot {
+	__u64 regs[31];
+	__u64 sp;
+	__u64 pc;
+	__u64 pstate;
+	__u64 stack_base;
+	__u32 stack_size;
+	__u32 reserved0;
+	__u8 stack[RD_WPCTL_MAX_DWARF_STACK_BYTES];
+};
+
+/**
+ * @brief 拉取 DWARF 模式下的一条 seed/reuse raw event。
+ */
+struct rd_wpctl_dwarf_event_req {
+	__u32 thread_index;
+	__u32 event_index;
+	__u8 used;
+	__u8 bucket;
+	__u8 reserved0[6];
+	__s32 tid;
+	__u32 target_index;
+	__u64 seed_pc_offset;
+	__u64 seed_pc;
+	__u64 reuse_pc;
+	__u64 seed_access;
+	__u64 hit_access;
+	__u64 delta;
+	struct rd_wpctl_dwarf_snapshot seed;
+	struct rd_wpctl_dwarf_snapshot reuse;
+};
+
+/**
+ * @brief `RDKIOC_GET_DWARF_EVENT` 的 ioctl 编码使用小结构，实际 arg 仍指向
+ * `rd_wpctl_dwarf_event_req`，避免超大结构超过 ioctl size 编码限制。
+ */
+struct rd_wpctl_dwarf_event_key {
+	__u32 thread_index;
+	__u32 event_index;
 };
 
 /** @brief 配置会话参数。 */
@@ -152,5 +254,11 @@ struct rd_wpctl_hist_req {
 #define RDKIOC_GET_THREAD_STATS _IOWR(RD_WPCTL_IOCTL_MAGIC, 8, struct rd_wpctl_thread_stats)
 /** @brief 获取一个线程上某个 target 的 `log2` 直方图。 */
 #define RDKIOC_GET_LOG2_HIST   _IOWR(RD_WPCTL_IOCTL_MAGIC, 9, struct rd_wpctl_hist_req)
+/** @brief 获取一个线程上的一条 use-reuse pair `log2` 直方图。 */
+#define RDKIOC_GET_PAIR_HIST_ENTRY _IOWR(RD_WPCTL_IOCTL_MAGIC, 11, struct rd_wpctl_pair_hist_req)
+/** @brief 获取一个线程上的一条调用上下文。 */
+#define RDKIOC_GET_CONTEXT_ENTRY _IOWR(RD_WPCTL_IOCTL_MAGIC, 12, struct rd_wpctl_context_req)
+/** @brief 获取一个线程上的一条 DWARF raw event。 */
+#define RDKIOC_GET_DWARF_EVENT _IOWR(RD_WPCTL_IOCTL_MAGIC, 13, struct rd_wpctl_dwarf_event_key)
 
 #endif

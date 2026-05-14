@@ -179,6 +179,12 @@ private:
     uint32_t _watchpoint_capacity;
     /** @brief execute breakpoint 的稀疏采样周期。 */
     uint64_t _bp_sample_period;
+    /** @brief 调用上下文采集模式。 */
+    uint32_t _callchain_mode;
+    /** @brief DWARF 模式每个快照复制的用户栈字节数。 */
+    uint32_t _dwarf_stack_bytes;
+    /** @brief DWARF 模式每线程 raw event 容量。 */
+    uint32_t _dwarf_event_capacity;
     /** @brief 输出文件名前缀。 */
     std::string _nameprefix;
     /** @brief 输入热点 manifest 路径。 */
@@ -219,6 +225,30 @@ private:
      * @param thread_index 模块内部线程索引。
      */
     void write_thread_histograms(const rd_wpctl_thread_stats& stats, uint32_t thread_index);
+
+    /**
+     * @brief 为一个线程写出 use-reuse pair 的 log2 直方图。
+     *
+     * @param stats 模块返回的线程级统计。
+     * @param thread_index 模块内部线程索引。
+     */
+    void write_thread_pair_histograms(const rd_wpctl_thread_stats& stats, uint32_t thread_index);
+
+    /**
+     * @brief 为一个线程写出 context_id 到 callchain IP 列表的映射。
+     *
+     * @param stats 模块返回的线程级统计。
+     * @param thread_index 模块内部线程索引。
+     */
+    void write_thread_contexts(const rd_wpctl_thread_stats& stats, uint32_t thread_index);
+
+    /**
+     * @brief 为一个线程写出 DWARF raw event 文件。
+     *
+     * @param stats 模块返回的线程级统计。
+     * @param thread_index 模块内部线程索引。
+     */
+    void write_thread_dwarf_events(const rd_wpctl_thread_stats& stats, uint32_t thread_index);
 
     /** @brief 分配一个当前未被占用的 CPU。 */
     int allocate_cpu_locked();

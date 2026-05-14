@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 
@@ -35,6 +36,8 @@ namespace {
 
 constexpr uint32_t DEFAULT_WP_CAPACITY = 4;
 constexpr uint64_t DEFAULT_BP_SAMPLE_PERIOD = 1024;
+constexpr uint32_t DEFAULT_DWARF_STACK_BYTES = 8192;
+constexpr uint32_t DEFAULT_DWARF_EVENT_CAPACITY = 16384;
 
 /** @brief 兼容方式获取当前线程 ID。 */
 static int gettid_portable()
@@ -493,6 +496,17 @@ static uint64_t bucket_hi(uint32_t bucket)
     return (1ULL << bucket) - 1ULL;
 }
 
+/** @brief 把调用上下文模式转成元数据字符串。 */
+static const char *callchain_mode_name(uint32_t mode)
+{
+    switch (mode) {
+    case RD_CALLCHAIN_OFF: return "off";
+    case RD_CALLCHAIN_FP: return "fp";
+    case RD_CALLCHAIN_DWARF: return "dwarf";
+    default: return "unknown";
+    }
+}
+
 } // namespace
 
 /**
@@ -509,6 +523,9 @@ TargetedRdProfiler::TargetedRdProfiler(const char *profile_name, bool is_pin)
     , _device_fd(-1)
     , _watchpoint_capacity(DEFAULT_WP_CAPACITY)
     , _bp_sample_period(DEFAULT_BP_SAMPLE_PERIOD)
+    , _callchain_mode(RD_CALLCHAIN_OFF)
+    , _dwarf_stack_bytes(DEFAULT_DWARF_STACK_BYTES)
+    , _dwarf_event_capacity(DEFAULT_DWARF_EVENT_CAPACITY)
     , _nameprefix(profile_name ? profile_name : "rd")
     , _rd_event_name("mem_access")
     , _instruction_support("aarch64 objdump-parsed ldr/str/ldur/stur with [base], [base,#imm], [base,index{,extend #shift}]")
@@ -539,6 +556,36 @@ TargetedRdProfiler::TargetedRdProfiler(const char *profile_name, bool is_pin)
         _rd_event_name = env_event;
     if (_rd_event_name != "mem_access")
         throw RdException("kernel targeted_rd only supports RD_RD_EVENT=mem_access");
+
+    const char *env_callchain = getenv("RD_CALLCHAIN_MODE");
+    if (env_callchain && *env_callchain) {
+        std::string mode = env_callchain;
+        if (mode == "off")
+            _callchain_mode = RD_CALLCHAIN_OFF;
+        else if (mode == "fp")
+            _callchain_mode = RD_CALLCHAIN_FP;
+        else if (mode == "dwarf")
+            _callchain_mode = RD_CALLCHAIN_DWARF;
+        else
+            throw RdException("RD_CALLCHAIN_MODE must be off, fp, or dwarf");
+    }
+
+    const char *env_dwarf_stack = getenv("RD_DWARF_STACK_BYTES");
+    if (env_dwarf_stack && *env_dwarf_stack) {
+        long v = strtol(env_dwarf_stack, nullptr, 10);
+        if (v <= 0 || v > RD_WPCTL_MAX_DWARF_STACK_BYTES)
+            throw RdException("RD_DWARF_STACK_BYTES must be in [1, " +
+                              std::to_string(RD_WPCTL_MAX_DWARF_STACK_BYTES) + "]");
+        _dwarf_stack_bytes = (uint32_t)v;
+    }
+
+    const char *env_dwarf_capacity = getenv("RD_DWARF_EVENT_CAPACITY");
+    if (env_dwarf_capacity && *env_dwarf_capacity) {
+        long v = strtol(env_dwarf_capacity, nullptr, 10);
+        if (v <= 0)
+            throw RdException("RD_DWARF_EVENT_CAPACITY must be positive");
+        _dwarf_event_capacity = (uint32_t)v;
+    }
 
     _main_binary_path = read_self_exe_path();
     if (_main_binary_path.empty())
@@ -596,7 +643,10 @@ void TargetedRdProfiler::configure_session()
     std::vector<rd_wpctl_target> targets(_targets.size());
 
     cfg.wp_capacity = _watchpoint_capacity;
+    cfg.callchain_mode = _callchain_mode;
     cfg.bp_sample_period = _bp_sample_period;
+    cfg.dwarf_stack_bytes = _callchain_mode == RD_CALLCHAIN_DWARF ? _dwarf_stack_bytes : 0;
+    cfg.dwarf_event_capacity = _callchain_mode == RD_CALLCHAIN_DWARF ? _dwarf_event_capacity : 0;
     if (ioctl(_device_fd, RDKIOC_CONFIG_SESSION, &cfg) < 0)
         throw RdException(std::string("RDKIOC_CONFIG_SESSION failed: ") + strerror(errno));
 
@@ -906,6 +956,126 @@ void TargetedRdProfiler::write_thread_histograms(const rd_wpctl_thread_stats& st
 }
 
 /**
+ * @brief 为一个线程拉取 use-reuse pair 的 log2 直方图并落盘。
+ */
+void TargetedRdProfiler::write_thread_pair_histograms(const rd_wpctl_thread_stats& stats, uint32_t thread_index)
+{
+    std::string log_path = _nameprefix + ".rd2.t" + std::to_string(stats.tid) + ".pair.hist.log2.txt";
+    std::ofstream log(log_path, std::ios::trunc);
+
+    if (!log.is_open())
+        throw RdException("cannot open " + log_path);
+
+    log << "seed_pc_offset\tseed_context_id\treuse_pc\treuse_context_id\tbucket_lo\tbucket_hi\tcount" << std::endl;
+    for (uint32_t entry_index = 0; entry_index < RD_WPCTL_MAX_PAIR_HISTS; entry_index++) {
+        rd_wpctl_pair_hist_req req = {};
+
+        req.thread_index = thread_index;
+        req.entry_index = entry_index;
+        if (ioctl(_device_fd, RDKIOC_GET_PAIR_HIST_ENTRY, &req) < 0)
+            throw RdException(std::string("RDKIOC_GET_PAIR_HIST_ENTRY failed: ") + strerror(errno));
+        if (!req.used)
+            continue;
+
+        for (uint32_t bucket = 0; bucket < RD_WPCTL_LOG2_BUCKETS; bucket++) {
+            uint64_t count = req.buckets[bucket];
+            if (!count)
+                continue;
+            log << "0x" << std::hex << req.seed_pc_offset << std::dec << "\t"
+                << req.seed_context_id << "\t"
+                << "0x" << std::hex << req.reuse_pc << std::dec << "\t"
+                << req.reuse_context_id << "\t"
+                << bucket_lo(bucket) << "\t"
+                << bucket_hi(bucket) << "\t"
+                << count << std::endl;
+        }
+    }
+}
+
+/**
+ * @brief 为一个线程拉取调用上下文表并落盘。
+ */
+void TargetedRdProfiler::write_thread_contexts(const rd_wpctl_thread_stats& stats, uint32_t thread_index)
+{
+    std::string log_path = _nameprefix + ".rd2.t" + std::to_string(stats.tid) + ".contexts.txt";
+    std::ofstream log(log_path, std::ios::trunc);
+
+    if (!log.is_open())
+        throw RdException("cannot open " + log_path);
+
+    log << "context_id\tdepth";
+    for (uint32_t i = 0; i < RD_WPCTL_MAX_CALLCHAIN_DEPTH; i++)
+        log << "\tip" << i;
+    log << std::endl;
+
+    for (uint32_t context_id = 1; context_id <= RD_WPCTL_MAX_CONTEXTS; context_id++) {
+        rd_wpctl_context_req req = {};
+
+        req.thread_index = thread_index;
+        req.context_id = context_id;
+        if (ioctl(_device_fd, RDKIOC_GET_CONTEXT_ENTRY, &req) < 0)
+            throw RdException(std::string("RDKIOC_GET_CONTEXT_ENTRY failed: ") + strerror(errno));
+        if (!req.used)
+            continue;
+
+        log << req.context_id << "\t" << static_cast<uint32_t>(req.depth);
+        for (uint32_t i = 0; i < RD_WPCTL_MAX_CALLCHAIN_DEPTH; i++) {
+            if (i < req.depth)
+                log << "\t0x" << std::hex << req.ips[i] << std::dec;
+            else
+                log << "\t0x0";
+        }
+        log << std::endl;
+    }
+}
+
+/**
+ * @brief 为一个线程拉取 DWARF raw events 并落盘。
+ */
+void TargetedRdProfiler::write_thread_dwarf_events(const rd_wpctl_thread_stats& stats, uint32_t thread_index)
+{
+    std::string bin_path = _nameprefix + ".rd2.t" + std::to_string(stats.tid) + ".dwarf.raw.bin";
+    std::string txt_path = _nameprefix + ".rd2.t" + std::to_string(stats.tid) + ".dwarf.raw.txt";
+    std::ofstream bin(bin_path, std::ios::binary | std::ios::trunc);
+    std::ofstream txt(txt_path, std::ios::trunc);
+
+    if (!bin.is_open())
+        throw RdException("cannot open " + bin_path);
+    if (!txt.is_open())
+        throw RdException("cannot open " + txt_path);
+
+    txt << "event_index\ttid\ttarget_index\tseed_pc_offset\tseed_pc\treuse_pc\tbucket_lo\tbucket_hi\tdelta\tseed_sp\treuse_sp\tseed_stack_size\treuse_stack_size" << std::endl;
+    for (uint32_t event_index = 0; event_index < stats.dwarf_event_used; event_index++) {
+        std::unique_ptr<rd_wpctl_dwarf_event_req> req(new rd_wpctl_dwarf_event_req());
+
+        req->thread_index = thread_index;
+        req->event_index = event_index;
+        if (ioctl(_device_fd, RDKIOC_GET_DWARF_EVENT, req.get()) < 0)
+            throw RdException(std::string("RDKIOC_GET_DWARF_EVENT failed: ") + strerror(errno));
+        if (!req->used)
+            continue;
+
+        bin.write(reinterpret_cast<const char *>(req.get()), sizeof(*req));
+        if (!bin.good())
+            throw RdException("write failed for " + bin_path);
+
+        txt << req->event_index << "\t"
+            << req->tid << "\t"
+            << req->target_index << "\t"
+            << "0x" << std::hex << req->seed_pc_offset << "\t"
+            << "0x" << req->seed_pc << "\t"
+            << "0x" << req->reuse_pc << std::dec << "\t"
+            << bucket_lo(req->bucket) << "\t"
+            << bucket_hi(req->bucket) << "\t"
+            << req->delta << "\t"
+            << "0x" << std::hex << req->seed.sp << "\t"
+            << "0x" << req->reuse.sp << std::dec << "\t"
+            << req->seed.stack_size << "\t"
+            << req->reuse.stack_size << std::endl;
+    }
+}
+
+/**
  * @brief 从模块拉取布局、线程统计和直方图，并写出 `.rd2.info`。
  */
 void TargetedRdProfiler::write_info()
@@ -915,6 +1085,15 @@ void TargetedRdProfiler::write_info()
     uint64_t total_evictions = 0;
     uint64_t total_dropped = 0;
     uint64_t total_seeds = 0;
+    uint64_t total_pair_hist_used = 0;
+    uint64_t total_pair_hist_dropped = 0;
+    uint64_t total_context_used = 0;
+    uint64_t total_context_dropped = 0;
+    uint64_t total_callchain_failed = 0;
+    uint64_t total_callchain_truncated = 0;
+    uint64_t total_dwarf_event_used = 0;
+    uint64_t total_dwarf_event_dropped = 0;
+    uint64_t total_dwarf_stack_copy_failed = 0;
 
     if (ioctl(_device_fd, RDKIOC_GET_LAYOUT, &layout) < 0)
         throw RdException(std::string("RDKIOC_GET_LAYOUT failed: ") + strerror(errno));
@@ -924,8 +1103,20 @@ void TargetedRdProfiler::write_info()
     _info_file << "targeted_rd_seed_source=execute_breakpoint" << std::endl;
     _info_file << "targeted_rd_rd_source=kernel_perf_event_read_value" << std::endl;
     _info_file << "targeted_rd_binary_patch=0" << std::endl;
-    _info_file << "targeted_rd_kernel_ebpf=0" << std::endl;
     _info_file << "hist_format=log2_only" << std::endl;
+    _info_file << "pair_hist_present=1" << std::endl;
+    _info_file << "pair_hist_key=seed_pc_offset,seed_context_id,reuse_pc,reuse_context_id" << std::endl;
+    _info_file << "pair_hist_reuse_pc_identity=raw_va" << std::endl;
+    _info_file << "pair_hist_capacity=" << RD_WPCTL_MAX_PAIR_HISTS << std::endl;
+    _info_file << "callchain_present=" << (_callchain_mode == RD_CALLCHAIN_OFF ? 0 : 1) << std::endl;
+    _info_file << "callchain_mode=" << callchain_mode_name(_callchain_mode) << std::endl;
+    _info_file << "callchain_max_depth=" << RD_WPCTL_MAX_CALLCHAIN_DEPTH << std::endl;
+    _info_file << "context_capacity=" << RD_WPCTL_MAX_CONTEXTS << std::endl;
+    if (_callchain_mode == RD_CALLCHAIN_DWARF) {
+        _info_file << "dwarf_unwind_present=1" << std::endl;
+        _info_file << "dwarf_stack_bytes=" << _dwarf_stack_bytes << std::endl;
+        _info_file << "dwarf_event_capacity=" << _dwarf_event_capacity << std::endl;
+    }
     _info_file << "window_mode=" << (_explicit_window_seen ? "explicit" : "auto_fallback") << std::endl;
     if (_auto_window_discarded_on_first_explicit)
         _info_file << "auto_window_discarded_on_first_explicit=1" << std::endl;
@@ -935,14 +1126,12 @@ void TargetedRdProfiler::write_info()
     _info_file << "rd_event=" << _rd_event_name << std::endl;
     _info_file << "candidate_source=sparse_execute_breakpoint_samples" << std::endl;
     _info_file << "breakpoint_sample_period=" << _bp_sample_period << std::endl;
-    _info_file << "reservoir_policy=idle_first_per_slot_replacement" << std::endl;
     _info_file << "reservoir_capacity=" << _watchpoint_capacity << std::endl;
     _info_file << "watchpoint_count=" << _watchpoint_capacity << std::endl;
     _info_file << "target_filter_policy=drop_unsupported_hotspots" << std::endl;
     _info_file << "requested_target_count=" << (_targets.size() + _rejected_targets.size()) << std::endl;
     _info_file << "rejected_target_count=" << _rejected_targets.size() << std::endl;
     _info_file << "cpu_binding=exclusive_process_local" << std::endl;
-    _info_file << "seed_reuse_policy=ignore_first_wp_hit_after_arm" << std::endl;
     _info_file << "target_count=" << _targets.size() << std::endl;
     for (size_t i = 0; i < _targets.size(); i++) {
         const hot_target& t = _targets[i];
@@ -974,15 +1163,48 @@ void TargetedRdProfiler::write_info()
                    << stats.reservoir_rejected << "\t"
                    << stats.hits << "\t"
                    << stats.evictions << "\t"
-                   << stats.dropped << std::endl;
+                   << stats.dropped << "\t"
+                   << stats.pair_hist_used << "\t"
+                   << stats.pair_hist_dropped << "\t"
+                   << stats.context_used << "\t"
+                   << stats.context_dropped << "\t"
+                   << stats.callchain_failed << "\t"
+                   << stats.callchain_truncated << "\t"
+                   << stats.dwarf_event_used << "\t"
+                   << stats.dwarf_event_dropped << "\t"
+                   << stats.dwarf_stack_copy_failed << "\t"
+                   << stats.dwarf_stack_bytes << std::endl;
         total_hits += stats.hits;
         total_evictions += stats.evictions;
         total_dropped += stats.dropped;
         total_seeds += stats.reservoir_accepted;
+        total_pair_hist_used += stats.pair_hist_used;
+        total_pair_hist_dropped += stats.pair_hist_dropped;
+        total_context_used += stats.context_used;
+        total_context_dropped += stats.context_dropped;
+        total_callchain_failed += stats.callchain_failed;
+        total_callchain_truncated += stats.callchain_truncated;
+        total_dwarf_event_used += stats.dwarf_event_used;
+        total_dwarf_event_dropped += stats.dwarf_event_dropped;
+        total_dwarf_stack_copy_failed += stats.dwarf_stack_copy_failed;
         write_thread_histograms(stats, i);
+        write_thread_pair_histograms(stats, i);
+        if (_callchain_mode == RD_CALLCHAIN_FP)
+            write_thread_contexts(stats, i);
+        if (_callchain_mode == RD_CALLCHAIN_DWARF)
+            write_thread_dwarf_events(stats, i);
     }
     _info_file << "seed_samples=" << total_seeds << std::endl;
     _info_file << "watchpoint_hits=" << total_hits << std::endl;
     _info_file << "evicted_pending_samples=" << total_evictions << std::endl;
     _info_file << "dropped_pending_samples=" << total_dropped << std::endl;
+    _info_file << "pair_hist_used=" << total_pair_hist_used << std::endl;
+    _info_file << "pair_hist_dropped=" << total_pair_hist_dropped << std::endl;
+    _info_file << "context_used=" << total_context_used << std::endl;
+    _info_file << "context_dropped=" << total_context_dropped << std::endl;
+    _info_file << "callchain_failed=" << total_callchain_failed << std::endl;
+    _info_file << "callchain_truncated=" << total_callchain_truncated << std::endl;
+    _info_file << "dwarf_event_used=" << total_dwarf_event_used << std::endl;
+    _info_file << "dwarf_event_dropped=" << total_dwarf_event_dropped << std::endl;
+    _info_file << "dwarf_stack_copy_failed=" << total_dwarf_stack_copy_failed << std::endl;
 }

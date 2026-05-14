@@ -6,6 +6,7 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/mm.h>
 #include <linux/perf_event.h>
 #include <linux/pid.h>
 #include <linux/rculist.h>
@@ -15,6 +16,8 @@
 #include <linux/types.h>
 #include <linux/uaccess.h>
 #include <linux/atomic.h>
+#include <linux/completion.h>
+#include <linux/refcount.h>
 
 #include <asm/perf_regs.h>
 #include <asm/ptrace.h>
@@ -36,6 +39,7 @@
 
 #define RD_IDLE_WP_LEN HW_BREAKPOINT_LEN_8
 #define RD_ARM64_MEM_ACCESS_RAW_EVENT 0x13
+#define RD_INVALID_INDEX ((u32)~0U)
 
 /** @brief 调试日志预算，非零时记录前若干次 bp/wp 关键事件。 */
 static unsigned int rd_debug_budget;
@@ -72,6 +76,29 @@ enum rd_wp_state {
 };
 
 /**
+ * @brief 一条 use-reuse pair 的 `log2` RD 直方图。
+ */
+struct rd_pair_hist_entry {
+	bool used;
+	u8 reserved[3];
+	u32 seed_context_id;
+	u32 reuse_context_id;
+	u64 seed_pc_offset;
+	u64 reuse_pc;
+	u64 buckets[RD_WPCTL_LOG2_BUCKETS];
+};
+
+/**
+ * @brief 一条用户态调用上下文。
+ */
+struct rd_context_entry {
+	bool used;
+	u8 depth;
+	u8 reserved[6];
+	u64 ips[RD_WPCTL_MAX_CALLCHAIN_DEPTH];
+};
+
+/**
  * @brief 单个线程在模块中的全部运行时状态。
  *
  * 一个线程上下文持有：
@@ -89,20 +116,29 @@ struct rd_thread_ctx {
 	pid_t tid;
 	int cpu;
 	bool active;
+	bool live_detached;
 	u64 scratch_base;
 	u64 scratch_stride;
 
 	spinlock_t lock;
+	refcount_t live_refs;
+	struct completion live_refs_zero;
 	struct perf_event *mem_event;
 	struct perf_event **bp_events;
 	struct perf_event **wp_events;
 	u64 *log2_hist;
+	struct rd_pair_hist_entry *pair_hist;
+	struct rd_context_entry *contexts;
+	struct rd_wpctl_dwarf_event_req *dwarf_events;
+	struct rd_wpctl_dwarf_snapshot *wp_seed_dwarf_snapshots;
+	struct rd_wpctl_dwarf_snapshot *wp_reuse_dwarf_snapshots;
 
 	enum rd_wp_state *wp_states;
 	u64 *wp_idle_addr;
 	u64 *wp_seed_va;
 	u64 *wp_seed_access;
 	u64 *wp_seed_pc_offset;
+	u32 *wp_seed_context_id;
 	u32 *wp_access_size;
 	u32 *wp_target_index;
 	u32 *wp_generation;
@@ -116,6 +152,15 @@ struct rd_thread_ctx {
 	u64 hits;
 	u64 evictions;
 	u64 dropped;
+	u32 pair_hist_used;
+	u64 pair_hist_dropped;
+	u32 context_used;
+	u64 context_dropped;
+	u64 callchain_failed;
+	u64 callchain_truncated;
+	u32 dwarf_event_used;
+	u64 dwarf_event_dropped;
+	u64 dwarf_stack_copy_failed;
 	u64 rng;
 };
 
@@ -134,6 +179,9 @@ struct rd_session {
 	bool targets_loaded;
 
 	u32 wp_capacity;
+	u32 callchain_mode;
+	u32 dwarf_stack_bytes;
+	u32 dwarf_event_capacity;
 	u64 bp_sample_period;
 	u32 target_count;
 	struct rd_target *targets;
@@ -308,6 +356,223 @@ static u32 rd_log2_bucket(u64 delta)
 }
 
 /**
+ * @brief 临时保存一次用户态 FP unwind 结果。
+ */
+struct rd_callchain_key {
+	u8 depth;
+	u8 reserved[7];
+	u64 ips[RD_WPCTL_MAX_CALLCHAIN_DEPTH];
+};
+
+/**
+ * @brief 从 ARM64 用户态 frame pointer 链采集调用上下文。
+ */
+static void rd_capture_callchain(struct rd_thread_ctx *thread, struct pt_regs *regs,
+				 struct rd_callchain_key *key)
+{
+	struct {
+		u64 prev_fp;
+		u64 lr;
+	} frame;
+	u64 fp;
+
+	memset(key, 0, sizeof(*key));
+	if (!regs || !user_mode(regs) || !instruction_pointer(regs)) {
+		thread->callchain_failed++;
+		return;
+	}
+
+	key->ips[0] = instruction_pointer(regs);
+	key->depth = 1;
+	fp = regs->regs[29];
+
+	while (key->depth < RD_WPCTL_MAX_CALLCHAIN_DEPTH) {
+		if (!fp)
+			return;
+		if (fp & 0x7)
+			return;
+		if (!access_ok((const void __user *)fp, sizeof(frame)))
+			return;
+		if (copy_from_user_nofault(&frame, (const void __user *)fp, sizeof(frame)))
+			return;
+		if (!frame.lr)
+			return;
+		if (frame.lr != key->ips[key->depth - 1])
+			key->ips[key->depth++] = frame.lr;
+		if (!frame.prev_fp)
+			return;
+		if (frame.prev_fp <= fp)
+			return;
+		fp = frame.prev_fp;
+	}
+
+	if (fp)
+		thread->callchain_truncated++;
+}
+
+/**
+ * @brief 复制用户态栈快照，失败时保留已成功复制的前缀。
+ */
+static void rd_copy_user_stack_snapshot(struct rd_thread_ctx *thread,
+					struct rd_wpctl_dwarf_snapshot *snap,
+					u64 sp)
+{
+	u32 want = thread->session->dwarf_stack_bytes;
+	u32 copied = 0;
+
+	if (want > RD_WPCTL_MAX_DWARF_STACK_BYTES)
+		want = RD_WPCTL_MAX_DWARF_STACK_BYTES;
+	snap->stack_base = sp;
+	snap->stack_size = 0;
+	if (!want || !sp)
+		return;
+
+	while (copied < want) {
+		u32 chunk = min_t(u32, 256, want - copied);
+		const void __user *src = (const void __user *)(sp + copied);
+
+		if (!access_ok(src, chunk))
+			break;
+		if (copy_from_user_nofault(&snap->stack[copied], src, chunk))
+			break;
+		copied += chunk;
+	}
+
+	snap->stack_size = copied;
+	if (!copied)
+		thread->dwarf_stack_copy_failed++;
+}
+
+/**
+ * @brief 保存 DWARF 离线展开需要的寄存器和用户栈。
+ */
+static void rd_capture_dwarf_snapshot(struct rd_thread_ctx *thread,
+				      struct pt_regs *regs,
+				      struct rd_wpctl_dwarf_snapshot *snap)
+{
+	u32 i;
+
+	memset(snap, 0, sizeof(*snap));
+	if (!regs || !user_mode(regs))
+		return;
+
+	for (i = 0; i < 31; i++)
+		snap->regs[i] = regs->regs[i];
+	snap->sp = regs->sp;
+	snap->pc = instruction_pointer(regs);
+	snap->pstate = regs->pstate;
+	rd_copy_user_stack_snapshot(thread, snap, regs->sp);
+}
+
+/**
+ * @brief 若开启 DWARF 模式，则为一次 reuse hit 预留 raw event 槽位。
+ */
+static bool rd_reserve_dwarf_event_locked(struct rd_thread_ctx *thread, u32 *event_index)
+{
+	if (thread->session->callchain_mode != RD_CALLCHAIN_DWARF ||
+	    !thread->dwarf_events ||
+	    !thread->session->dwarf_event_capacity) {
+		return false;
+	}
+	if (thread->dwarf_event_used >= thread->session->dwarf_event_capacity) {
+		thread->dwarf_event_dropped++;
+		return false;
+	}
+
+	*event_index = thread->dwarf_event_used++;
+	return true;
+}
+
+/**
+ * @brief 在持有 `thread->lock` 时获取或分配一个 context id。
+ */
+static u32 rd_get_context_id_locked(struct rd_thread_ctx *thread,
+				    const struct rd_callchain_key *key)
+{
+	struct rd_context_entry *free_entry = NULL;
+	u32 free_id = 0;
+	u32 i;
+
+	if (!thread->contexts || !key->depth) {
+		thread->context_dropped++;
+		return 0;
+	}
+
+	for (i = 0; i < RD_WPCTL_MAX_CONTEXTS; i++) {
+		struct rd_context_entry *entry = &thread->contexts[i];
+
+		if (entry->used) {
+			if (entry->depth == key->depth &&
+			    !memcmp(entry->ips, key->ips,
+				    sizeof(key->ips[0]) * key->depth))
+				return i + 1;
+			continue;
+		}
+		if (!free_entry) {
+			free_entry = entry;
+			free_id = i + 1;
+		}
+	}
+
+	if (!free_entry) {
+		thread->context_dropped++;
+		return 0;
+	}
+
+	free_entry->used = true;
+	free_entry->depth = key->depth;
+	memcpy(free_entry->ips, key->ips, sizeof(key->ips[0]) * key->depth);
+	thread->context_used++;
+	return free_id;
+}
+
+/**
+ * @brief 在持有 `thread->lock` 时更新 use-reuse pair 直方图。
+ */
+static void rd_add_pair_hist_locked(struct rd_thread_ctx *thread, u64 seed_pc_offset,
+				    u32 seed_context_id, u64 reuse_pc,
+				    u32 reuse_context_id, u32 bucket)
+{
+	struct rd_pair_hist_entry *free_entry = NULL;
+	u32 i;
+
+	if (!thread->pair_hist || !reuse_pc || bucket >= RD_WPCTL_LOG2_BUCKETS) {
+		thread->pair_hist_dropped++;
+		return;
+	}
+
+	for (i = 0; i < RD_WPCTL_MAX_PAIR_HISTS; i++) {
+		struct rd_pair_hist_entry *entry = &thread->pair_hist[i];
+
+		if (entry->used) {
+			if (entry->seed_pc_offset == seed_pc_offset &&
+			    entry->seed_context_id == seed_context_id &&
+			    entry->reuse_pc == reuse_pc &&
+			    entry->reuse_context_id == reuse_context_id) {
+				entry->buckets[bucket]++;
+				return;
+			}
+			continue;
+		}
+		if (!free_entry)
+			free_entry = entry;
+	}
+
+	if (!free_entry) {
+		thread->pair_hist_dropped++;
+		return;
+	}
+
+	free_entry->used = true;
+	free_entry->seed_context_id = seed_context_id;
+	free_entry->reuse_context_id = reuse_context_id;
+	free_entry->seed_pc_offset = seed_pc_offset;
+	free_entry->reuse_pc = reuse_pc;
+	free_entry->buckets[bucket] = 1;
+	thread->pair_hist_used++;
+}
+
+/**
  * @brief 读取当前线程的 `mem_access` 计数值。
  */
 static int rd_read_mem_access(struct rd_thread_ctx *thread, u64 *value)
@@ -362,6 +627,9 @@ static int rd_modify_slot(struct rd_thread_ctx *thread, u32 slot_index, u64 addr
 {
 	struct perf_event_attr attr;
 
+	if (!thread || !thread->session || !thread->wp_events ||
+	    slot_index >= thread->session->wp_capacity)
+		return -EINVAL;
 	if (!thread->wp_events[slot_index])
 		return -EINVAL;
 	rd_init_wp_attr(&attr, addr, len);
@@ -375,15 +643,22 @@ static int rd_modify_slot(struct rd_thread_ctx *thread, u32 slot_index, u64 addr
  */
 static void rd_clear_slot_metadata(struct rd_thread_ctx *thread, u32 slot_index)
 {
+	if (!thread || !thread->session || slot_index >= thread->session->wp_capacity)
+		return;
+
 	thread->wp_states[slot_index] = RD_WP_IDLE;
 	thread->wp_seed_va[slot_index] = 0;
 	thread->wp_seed_access[slot_index] = 0;
 	thread->wp_seed_pc_offset[slot_index] = 0;
+	thread->wp_seed_context_id[slot_index] = 0;
 	thread->wp_access_size[slot_index] = 0;
 	thread->wp_target_index[slot_index] = 0;
 	thread->wp_skip_first_hit[slot_index] = 0;
 	if (thread->wp_samples)
 		thread->wp_samples[slot_index] = 1;
+	if (thread->wp_seed_dwarf_snapshots)
+		memset(&thread->wp_seed_dwarf_snapshots[slot_index], 0,
+		       sizeof(thread->wp_seed_dwarf_snapshots[slot_index]));
 }
 
 /**
@@ -421,9 +696,33 @@ static int rd_reset_thread_locked(struct rd_thread_ctx *thread)
 	thread->hits = 0;
 	thread->evictions = 0;
 	thread->dropped = 0;
+	thread->pair_hist_used = 0;
+	thread->pair_hist_dropped = 0;
+	thread->context_used = 0;
+	thread->context_dropped = 0;
+	thread->callchain_failed = 0;
+	thread->callchain_truncated = 0;
+	thread->dwarf_event_used = 0;
+	thread->dwarf_event_dropped = 0;
+	thread->dwarf_stack_copy_failed = 0;
 	thread->rng = 0x9e3779b97f4a7c15ULL ^ (u64)(u32)thread->tid;
 	if (thread->log2_hist && hist_bytes)
 		memset(thread->log2_hist, 0, hist_bytes);
+	if (thread->pair_hist)
+		memset(thread->pair_hist, 0,
+		       sizeof(*thread->pair_hist) * RD_WPCTL_MAX_PAIR_HISTS);
+	if (thread->contexts)
+		memset(thread->contexts, 0,
+		       sizeof(*thread->contexts) * RD_WPCTL_MAX_CONTEXTS);
+	if (thread->dwarf_events)
+		memset(thread->dwarf_events, 0,
+		       sizeof(*thread->dwarf_events) * thread->session->dwarf_event_capacity);
+	if (thread->wp_seed_dwarf_snapshots)
+		memset(thread->wp_seed_dwarf_snapshots, 0,
+		       sizeof(*thread->wp_seed_dwarf_snapshots) * thread->session->wp_capacity);
+	if (thread->wp_reuse_dwarf_snapshots)
+		memset(thread->wp_reuse_dwarf_snapshots, 0,
+		       sizeof(*thread->wp_reuse_dwarf_snapshots) * thread->session->wp_capacity);
 	if (thread->wp_states) {
 		for (i = 0; i < thread->session->wp_capacity; i++) {
 			rd_clear_slot_metadata(thread, i);
@@ -439,8 +738,7 @@ static int rd_reset_thread_locked(struct rd_thread_ctx *thread)
 /**
  * @brief 选择候选样本要安装到的 watchpoint slot。
  *
- * 策略与 ReuseTracker 的 slot-local replacement 语义一致：idle slot
- * 立即接受候选；所有 slot 都 active 时，每个 slot 用自己的 sample
+ * 策略：idle slot 立即接受候选；所有 slot 都 active 时，每个 slot 用自己的 sample
  * 计数执行 `1 / samples` 概率替换判定。
  */
 static bool rd_pick_wp_slot(struct rd_thread_ctx *thread, u32 *slot_index,
@@ -449,6 +747,10 @@ static bool rd_pick_wp_slot(struct rd_thread_ctx *thread, u32 *slot_index,
 	u32 i;
 	u32 capacity = thread->session->wp_capacity;
 
+	if (!slot_index || !is_replacement)
+		return false;
+	*slot_index = RD_INVALID_INDEX;
+	*is_replacement = false;
 	thread->reservoir_seen++;
 	if (capacity == 0)
 		return false;
@@ -506,6 +808,36 @@ static void rd_remove_live_thread(struct rd_thread_ctx *thread)
 }
 
 /**
+ * @brief 在 RCU 读侧为命中路径 pin 住一个线程的 live resources。
+ */
+static bool rd_thread_live_get_rcu(struct rd_thread_ctx *thread)
+{
+	if (!thread)
+		return false;
+	if (!READ_ONCE(thread->active) || READ_ONCE(thread->live_detached))
+		return false;
+	if (!refcount_inc_not_zero(&thread->live_refs))
+		return false;
+	if (!READ_ONCE(thread->active) || READ_ONCE(thread->live_detached)) {
+		if (refcount_dec_and_test(&thread->live_refs))
+			complete(&thread->live_refs_zero);
+		return false;
+	}
+	return true;
+}
+
+/**
+ * @brief 释放一次命中路径持有的 live-resource 引用。
+ */
+static void rd_thread_live_put(struct rd_thread_ctx *thread)
+{
+	if (!thread)
+		return;
+	if (refcount_dec_and_test(&thread->live_refs))
+		complete(&thread->live_refs_zero);
+}
+
+/**
  * @brief 在活跃线程集合中反查某个 breakpoint event 对应的 target。
  */
 static bool rd_lookup_bp_site_rcu(struct perf_event *event, struct rd_thread_ctx **thread_out,
@@ -514,13 +846,22 @@ static bool rd_lookup_bp_site_rcu(struct perf_event *event, struct rd_thread_ctx
 	struct rd_thread_ctx *thread;
 	u32 i;
 
+	if (thread_out)
+		*thread_out = NULL;
+	if (target_index_out)
+		*target_index_out = RD_INVALID_INDEX;
+	if (!thread_out || !target_index_out)
+		return false;
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(thread, &rd_live_threads, live_node) {
-		if (!thread->active || !thread->bp_events)
+		if (!READ_ONCE(thread->active) || !thread->bp_events)
 			continue;
 		for (i = 0; i < thread->session->target_count; i++) {
 			if (thread->bp_events[i] != event)
 				continue;
+			if (!rd_thread_live_get_rcu(thread))
+				break;
 			*thread_out = thread;
 			*target_index_out = i;
 			rcu_read_unlock();
@@ -540,13 +881,22 @@ static bool rd_lookup_wp_slot_rcu(struct perf_event *event, struct rd_thread_ctx
 	struct rd_thread_ctx *thread;
 	u32 i;
 
+	if (thread_out)
+		*thread_out = NULL;
+	if (slot_index_out)
+		*slot_index_out = RD_INVALID_INDEX;
+	if (!thread_out || !slot_index_out)
+		return false;
+
 	rcu_read_lock();
 	list_for_each_entry_rcu(thread, &rd_live_threads, live_node) {
-		if (!thread->active || !thread->wp_events)
+		if (!READ_ONCE(thread->active) || !thread->wp_events)
 			continue;
 		for (i = 0; i < thread->session->wp_capacity; i++) {
 			if (thread->wp_events[i] != event)
 				continue;
+			if (!rd_thread_live_get_rcu(thread))
+				break;
 			*thread_out = thread;
 			*slot_index_out = i;
 			rcu_read_unlock();
@@ -572,15 +922,18 @@ static void rd_handle_bp_hit(struct rd_thread_ctx *thread, u32 target_index, str
 	unsigned long flags;
 	u64 seed_va;
 	u64 seed_access = 0;
-	bool accepted = false;
 	bool is_replacement = false;
-	u32 slot_index = 0;
+	struct rd_callchain_key seed_callchain;
+	u32 slot_index = RD_INVALID_INDEX;
 	u32 new_generation = 0;
 	u32 access_size = 0;
+	u32 seed_context_id = 0;
+	u64 idle_addr = 0;
 	int read_ret;
 	int mod_ret;
 
-	if (!thread || !regs || !thread->active || !thread->session->running)
+	if (!thread || !regs || !thread->active || !thread->session->running ||
+	    target_index >= thread->session->target_count)
 		return;
 
 	target = &thread->session->targets[target_index];
@@ -589,37 +942,54 @@ static void rd_handle_bp_hit(struct rd_thread_ctx *thread, u32 target_index, str
 	read_ret = rd_read_mem_access(thread, &seed_access);
 	if (read_ret)
 		return;
+	memset(&seed_callchain, 0, sizeof(seed_callchain));
+	if (thread->session->callchain_mode == RD_CALLCHAIN_FP)
+		rd_capture_callchain(thread, regs, &seed_callchain);
 
 	spin_lock_irqsave(&thread->lock, flags);
 	thread->candidate_samples++;
-	if (rd_pick_wp_slot(thread, &slot_index, &is_replacement)) {
-		accepted = true;
-		if (is_replacement && thread->wp_states[slot_index] == RD_WP_ARMED)
-			thread->evictions++;
-		new_generation = thread->wp_generation[slot_index] + 1;
-		if (!new_generation)
-			new_generation = 1;
-		thread->wp_states[slot_index] = RD_WP_ARMED;
-		thread->wp_seed_va[slot_index] = seed_va;
-		thread->wp_seed_access[slot_index] = seed_access;
-		thread->wp_seed_pc_offset[slot_index] = target->pc_offset;
-		thread->wp_access_size[slot_index] = access_size;
-		thread->wp_target_index[slot_index] = target_index;
-		thread->wp_generation[slot_index] = new_generation;
-		thread->wp_skip_first_hit[slot_index] = 1;
-		if (thread->wp_samples)
-			thread->wp_samples[slot_index] = 1;
+	if (!rd_pick_wp_slot(thread, &slot_index, &is_replacement)) {
+		spin_unlock_irqrestore(&thread->lock, flags);
+		return;
 	}
+	if (slot_index >= thread->session->wp_capacity) {
+		thread->reservoir_rejected++;
+		spin_unlock_irqrestore(&thread->lock, flags);
+		return;
+	}
+
+	if (thread->session->callchain_mode == RD_CALLCHAIN_FP &&
+	    seed_callchain.depth)
+		seed_context_id = rd_get_context_id_locked(thread, &seed_callchain);
+	if (is_replacement && thread->wp_states[slot_index] == RD_WP_ARMED)
+		thread->evictions++;
+	new_generation = thread->wp_generation[slot_index] + 1;
+	if (!new_generation)
+		new_generation = 1;
+	thread->wp_states[slot_index] = RD_WP_ARMED;
+	thread->wp_seed_va[slot_index] = seed_va;
+	thread->wp_seed_access[slot_index] = seed_access;
+	thread->wp_seed_pc_offset[slot_index] = target->pc_offset;
+	thread->wp_seed_context_id[slot_index] = seed_context_id;
+	thread->wp_access_size[slot_index] = access_size;
+	thread->wp_target_index[slot_index] = target_index;
+	thread->wp_generation[slot_index] = new_generation;
+	thread->wp_skip_first_hit[slot_index] = 1;
+	if (thread->wp_samples)
+		thread->wp_samples[slot_index] = 1;
+	idle_addr = thread->wp_idle_addr[slot_index];
 	spin_unlock_irqrestore(&thread->lock, flags);
 
-	if (!accepted)
-		return;
+	if (thread->session->callchain_mode == RD_CALLCHAIN_DWARF &&
+	    thread->wp_seed_dwarf_snapshots)
+		rd_capture_dwarf_snapshot(thread, regs,
+					  &thread->wp_seed_dwarf_snapshots[slot_index]);
 
 	if (rd_debug_take_token()) {
-		pr_info("rd_wpctl: bp-overflow-seed tid=%d cpu=%d target=%u pc_off=0x%llx slot=%u seed_va=0x%llx seed_access=%llu access_size=%u\n",
+		pr_info("rd_wpctl: bp-overflow-seed tid=%d cpu=%d target=%u pc_off=0x%llx seed_ctx=%u slot=%u seed_va=0x%llx seed_access=%llu access_size=%u\n",
 			thread->tid, thread->cpu, target_index,
 			thread->session->targets[target_index].pc_offset,
-			slot_index, seed_va, seed_access, access_size);
+			seed_context_id, slot_index, seed_va, seed_access, access_size);
 	}
 
 	mod_ret = rd_modify_slot(thread, slot_index, seed_va, access_size);
@@ -628,7 +998,7 @@ static void rd_handle_bp_hit(struct rd_thread_ctx *thread, u32 target_index, str
 		thread->dropped++;
 		rd_clear_slot_metadata(thread, slot_index);
 		spin_unlock_irqrestore(&thread->lock, flags);
-		rd_modify_slot(thread, slot_index, thread->wp_idle_addr[slot_index], RD_IDLE_WP_LEN);
+		rd_modify_slot(thread, slot_index, idle_addr, RD_IDLE_WP_LEN);
 		return;
 	}
 }
@@ -641,16 +1011,26 @@ static void rd_handle_bp_hit(struct rd_thread_ctx *thread, u32 target_index, str
  *
  * `delta = hit_access - seed_access - 1`
  */
-static void rd_handle_wp_hit(struct rd_thread_ctx *thread, u32 slot_index)
+static void rd_handle_wp_hit(struct rd_thread_ctx *thread, u32 slot_index,
+			     struct pt_regs *regs)
 {
 	unsigned long flags;
 	u64 seed_access = 0;
 	u64 hit_access = 0;
 	u64 delta = 0;
-	u32 target_index = 0;
+	u64 seed_pc_offset = 0;
+	u64 seed_va = 0;
+	u64 reuse_pc = 0;
+	struct rd_callchain_key reuse_callchain;
+	u32 target_index = RD_INVALID_INDEX;
+	u32 seed_context_id = 0;
+	u32 reuse_context_id = 0;
 	u32 bucket = 0;
+	u32 dwarf_event_index = 0;
 	size_t hist_index = 0;
+	u64 idle_addr = 0;
 	int read_ret;
+	bool dwarf_event_reserved = false;
 
 	if (!thread || !thread->active || !thread->session->running)
 		return;
@@ -679,26 +1059,81 @@ static void rd_handle_wp_hit(struct rd_thread_ctx *thread, u32 slot_index)
 
 	target_index = thread->wp_target_index[slot_index];
 	seed_access = thread->wp_seed_access[slot_index];
+	seed_pc_offset = thread->wp_seed_pc_offset[slot_index];
+	seed_va = thread->wp_seed_va[slot_index];
+	seed_context_id = thread->wp_seed_context_id[slot_index];
+	idle_addr = thread->wp_idle_addr[slot_index];
+	if (target_index >= thread->session->target_count) {
+		thread->dropped++;
+		rd_clear_slot_metadata(thread, slot_index);
+		spin_unlock_irqrestore(&thread->lock, flags);
+		rd_modify_slot(thread, slot_index, idle_addr, RD_IDLE_WP_LEN);
+		return;
+	}
+	reuse_pc = regs ? instruction_pointer(regs) : 0;
 	spin_unlock_irqrestore(&thread->lock, flags);
 
+	memset(&reuse_callchain, 0, sizeof(reuse_callchain));
+	if (thread->session->callchain_mode == RD_CALLCHAIN_FP)
+		rd_capture_callchain(thread, regs, &reuse_callchain);
+	if (thread->session->callchain_mode == RD_CALLCHAIN_DWARF &&
+	    thread->wp_reuse_dwarf_snapshots)
+		rd_capture_dwarf_snapshot(thread, regs,
+					  &thread->wp_reuse_dwarf_snapshots[slot_index]);
 	read_ret = rd_read_mem_access(thread, &hit_access);
 	if (!read_ret) {
 		delta = hit_access > seed_access ? (hit_access - seed_access - 1) : 0;
 		bucket = rd_log2_bucket(delta);
 		hist_index = (size_t)target_index * RD_WPCTL_LOG2_BUCKETS + bucket;
 		if (rd_debug_take_token()) {
-			pr_info("rd_wpctl: wp-hit tid=%d cpu=%d slot=%u target=%u seed_va=0x%llx seed_access=%llu hit_access=%llu delta=%llu bucket=%u\n",
+			pr_info("rd_wpctl: wp-hit tid=%d cpu=%d slot=%u target=%u seed_pc=0x%llx reuse_pc=0x%llx seed_va=0x%llx seed_access=%llu hit_access=%llu delta=%llu bucket=%u\n",
 				thread->tid, thread->cpu, slot_index, target_index,
-				thread->wp_seed_va[slot_index], seed_access,
-				hit_access, delta, bucket);
+				seed_pc_offset, reuse_pc,
+				seed_va, seed_access, hit_access, delta, bucket);
 		}
 		spin_lock_irqsave(&thread->lock, flags);
+		if (thread->session->callchain_mode == RD_CALLCHAIN_FP &&
+		    reuse_callchain.depth)
+			reuse_context_id = rd_get_context_id_locked(thread, &reuse_callchain);
 		if (thread->log2_hist &&
 		    target_index < thread->session->target_count &&
 		    hist_index < (size_t)thread->session->target_count * RD_WPCTL_LOG2_BUCKETS)
 			thread->log2_hist[hist_index]++;
+		rd_add_pair_hist_locked(thread, seed_pc_offset, seed_context_id,
+					reuse_pc, reuse_context_id, bucket);
+		if (thread->session->callchain_mode == RD_CALLCHAIN_DWARF)
+			dwarf_event_reserved = rd_reserve_dwarf_event_locked(thread,
+									     &dwarf_event_index);
 		thread->hits++;
 		spin_unlock_irqrestore(&thread->lock, flags);
+		if (dwarf_event_reserved) {
+			struct rd_wpctl_dwarf_event_req *event =
+				&thread->dwarf_events[dwarf_event_index];
+
+			memset(event, 0, sizeof(*event));
+			event->thread_index = 0;
+			event->event_index = dwarf_event_index;
+			event->bucket = bucket;
+			event->tid = thread->tid;
+			event->target_index = target_index;
+			event->seed_pc_offset = seed_pc_offset;
+			event->seed_pc = thread->wp_seed_dwarf_snapshots ?
+				thread->wp_seed_dwarf_snapshots[slot_index].pc : 0;
+			event->reuse_pc = reuse_pc;
+			event->seed_access = seed_access;
+			event->hit_access = hit_access;
+			event->delta = delta;
+				if (thread->wp_seed_dwarf_snapshots)
+					memcpy(&event->seed,
+					       &thread->wp_seed_dwarf_snapshots[slot_index],
+					       sizeof(event->seed));
+				if (thread->wp_reuse_dwarf_snapshots)
+					memcpy(&event->reuse,
+					       &thread->wp_reuse_dwarf_snapshots[slot_index],
+					       sizeof(event->reuse));
+			smp_wmb();
+			event->used = 1;
+		}
 	} else {
 		spin_lock_irqsave(&thread->lock, flags);
 		thread->dropped++;
@@ -711,7 +1146,7 @@ static void rd_handle_wp_hit(struct rd_thread_ctx *thread, u32 slot_index)
 		rd_clear_slot_metadata(thread, slot_index);
 	spin_unlock_irqrestore(&thread->lock, flags);
 
-	rd_modify_slot(thread, slot_index, thread->wp_idle_addr[slot_index], RD_IDLE_WP_LEN);
+	rd_modify_slot(thread, slot_index, idle_addr, RD_IDLE_WP_LEN);
 }
 
 /**
@@ -739,7 +1174,7 @@ static int rd_perf_event_overflow_pre(struct kprobe *kp, struct pt_regs *regs)
 	struct perf_event *event = (struct perf_event *)regs->regs[0];
 	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[3];
 	struct rd_thread_ctx *thread = NULL;
-	u32 target_index = 0;
+	u32 target_index = RD_INVALID_INDEX;
 
 	(void)kp;
 	if (!event || !user_regs)
@@ -748,9 +1183,12 @@ static int rd_perf_event_overflow_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	if (!rd_lookup_bp_site_rcu(event, &thread, &target_index))
 		return 0;
-	if (!thread || current->pid != thread->tid)
+	if (!thread || target_index == RD_INVALID_INDEX || current->pid != thread->tid) {
+		rd_thread_live_put(thread);
 		return 0;
+	}
 	rd_handle_bp_hit(thread, target_index, user_regs);
+	rd_thread_live_put(thread);
 	return 0;
 }
 
@@ -762,15 +1200,23 @@ static int rd_perf_event_overflow_pre(struct kprobe *kp, struct pt_regs *regs)
 static int rd_watchpoint_report_pre(struct kprobe *kp, struct pt_regs *regs)
 {
 	struct perf_event *event = (struct perf_event *)regs->regs[0];
+	struct pt_regs *user_regs = (struct pt_regs *)regs->regs[2];
 	struct rd_thread_ctx *thread = NULL;
-	u32 slot_index = 0;
+	u32 slot_index = RD_INVALID_INDEX;
 
 	(void)kp;
 	if (!event)
 		return 0;
+	if (!user_regs || !user_mode(user_regs))
+		return 0;
 	if (!rd_lookup_wp_slot_rcu(event, &thread, &slot_index))
 		return 0;
-	rd_handle_wp_hit(thread, slot_index);
+	if (!thread || slot_index == RD_INVALID_INDEX) {
+		rd_thread_live_put(thread);
+		return 0;
+	}
+	rd_handle_wp_hit(thread, slot_index, user_regs);
+	rd_thread_live_put(thread);
 	return 0;
 }
 
@@ -873,19 +1319,41 @@ static int rd_thread_setup_events(struct rd_thread_ctx *thread)
 	thread->wp_events = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_events), GFP_KERNEL);
 	hist_entries = (size_t)thread->session->target_count * RD_WPCTL_LOG2_BUCKETS;
 	thread->log2_hist = kcalloc(hist_entries, sizeof(*thread->log2_hist), GFP_KERNEL);
+	thread->pair_hist = kvcalloc(RD_WPCTL_MAX_PAIR_HISTS, sizeof(*thread->pair_hist),
+				     GFP_KERNEL);
+	thread->contexts = kvcalloc(RD_WPCTL_MAX_CONTEXTS, sizeof(*thread->contexts),
+				    GFP_KERNEL);
+	if (thread->session->callchain_mode == RD_CALLCHAIN_DWARF) {
+		thread->dwarf_events = kvcalloc(thread->session->dwarf_event_capacity,
+						sizeof(*thread->dwarf_events),
+						GFP_KERNEL);
+			thread->wp_seed_dwarf_snapshots =
+				kvcalloc(thread->session->wp_capacity,
+					 sizeof(*thread->wp_seed_dwarf_snapshots),
+					 GFP_KERNEL);
+			thread->wp_reuse_dwarf_snapshots =
+				kvcalloc(thread->session->wp_capacity,
+					 sizeof(*thread->wp_reuse_dwarf_snapshots),
+					 GFP_KERNEL);
+	}
 	thread->wp_states = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_states), GFP_KERNEL);
 	thread->wp_idle_addr = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_idle_addr), GFP_KERNEL);
 	thread->wp_seed_va = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_seed_va), GFP_KERNEL);
 	thread->wp_seed_access = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_seed_access), GFP_KERNEL);
 	thread->wp_seed_pc_offset = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_seed_pc_offset), GFP_KERNEL);
+	thread->wp_seed_context_id = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_seed_context_id), GFP_KERNEL);
 	thread->wp_access_size = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_access_size), GFP_KERNEL);
 	thread->wp_target_index = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_target_index), GFP_KERNEL);
 	thread->wp_generation = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_generation), GFP_KERNEL);
 	thread->wp_skip_first_hit = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_skip_first_hit), GFP_KERNEL);
 	thread->wp_samples = kcalloc(thread->session->wp_capacity, sizeof(*thread->wp_samples), GFP_KERNEL);
-	if (!thread->bp_events || !thread->wp_events || !thread->log2_hist || !thread->wp_states ||
-	    !thread->wp_idle_addr || !thread->wp_seed_va || !thread->wp_seed_access ||
-	    !thread->wp_seed_pc_offset ||
+	if (!thread->bp_events || !thread->wp_events || !thread->log2_hist || !thread->pair_hist ||
+		    !thread->contexts ||
+		    (thread->session->callchain_mode == RD_CALLCHAIN_DWARF &&
+		     (!thread->dwarf_events || !thread->wp_seed_dwarf_snapshots ||
+		      !thread->wp_reuse_dwarf_snapshots)) ||
+	    !thread->wp_states || !thread->wp_idle_addr || !thread->wp_seed_va || !thread->wp_seed_access ||
+	    !thread->wp_seed_pc_offset || !thread->wp_seed_context_id ||
 	    !thread->wp_access_size || !thread->wp_target_index ||
 	    !thread->wp_generation || !thread->wp_skip_first_hit || !thread->wp_samples) {
 		ret = -ENOMEM;
@@ -932,6 +1400,8 @@ static void rd_thread_free_live(struct rd_thread_ctx *thread)
 {
 	u32 i;
 
+	if (!thread)
+		return;
 	if (thread->mem_event) {
 		perf_event_disable(thread->mem_event);
 		perf_event_release_kernel(thread->mem_event);
@@ -962,11 +1432,14 @@ static void rd_thread_free_live(struct rd_thread_ctx *thread)
 	kfree(thread->wp_seed_va);
 	kfree(thread->wp_seed_access);
 	kfree(thread->wp_seed_pc_offset);
+	kfree(thread->wp_seed_context_id);
 	kfree(thread->wp_access_size);
 	kfree(thread->wp_target_index);
 	kfree(thread->wp_generation);
 	kfree(thread->wp_skip_first_hit);
 	kfree(thread->wp_samples);
+	kvfree(thread->wp_seed_dwarf_snapshots);
+	kvfree(thread->wp_reuse_dwarf_snapshots);
 	thread->bp_events = NULL;
 	thread->wp_events = NULL;
 	thread->wp_states = NULL;
@@ -974,15 +1447,53 @@ static void rd_thread_free_live(struct rd_thread_ctx *thread)
 	thread->wp_seed_va = NULL;
 	thread->wp_seed_access = NULL;
 	thread->wp_seed_pc_offset = NULL;
+	thread->wp_seed_context_id = NULL;
 	thread->wp_access_size = NULL;
 	thread->wp_target_index = NULL;
 	thread->wp_generation = NULL;
 	thread->wp_skip_first_hit = NULL;
 	thread->wp_samples = NULL;
+	thread->wp_seed_dwarf_snapshots = NULL;
+	thread->wp_reuse_dwarf_snapshots = NULL;
 	if (thread->task) {
 		put_task_struct(thread->task);
 		thread->task = NULL;
 	}
+}
+
+/**
+ * @brief 停用线程 live resources，并等待已 pin 的 kprobe handler 全部退出。
+ *
+ * 调用方仍保留 `rd_thread_ctx` 对象和结果数据；这里只释放 bp/wp/mem_event
+ * 以及 slot 相关 live arrays。
+ */
+static void rd_thread_detach_live(struct rd_thread_ctx *thread)
+{
+	unsigned long flags;
+	u32 i;
+
+	if (!thread || READ_ONCE(thread->live_detached))
+		return;
+
+	spin_lock_irqsave(&thread->lock, flags);
+	WRITE_ONCE(thread->active, false);
+	WRITE_ONCE(thread->live_detached, true);
+	spin_unlock_irqrestore(&thread->lock, flags);
+
+	rd_remove_live_thread(thread);
+	rd_thread_live_put(thread);
+	wait_for_completion(&thread->live_refs_zero);
+
+	spin_lock_irqsave(&thread->lock, flags);
+	if (thread->wp_states) {
+		for (i = 0; i < thread->session->wp_capacity; i++) {
+			if (thread->wp_states[i] == RD_WP_ARMED)
+				thread->dropped++;
+		}
+	}
+	spin_unlock_irqrestore(&thread->lock, flags);
+
+	rd_thread_free_live(thread);
 }
 
 /**
@@ -992,6 +1503,9 @@ static void rd_thread_destroy(struct rd_thread_ctx *thread)
 {
 	rd_thread_free_live(thread);
 	kfree(thread->log2_hist);
+	kvfree(thread->pair_hist);
+	kvfree(thread->contexts);
+	kvfree(thread->dwarf_events);
 	kfree(thread);
 }
 
@@ -1037,9 +1551,13 @@ static int rd_register_thread_locked(struct rd_session *session,
 	thread->cpu = arg->cpu;
 	thread->scratch_base = arg->scratch_base;
 	thread->scratch_stride = arg->scratch_stride;
-	thread->active = true;
+	WRITE_ONCE(thread->active, true);
+	WRITE_ONCE(thread->live_detached, false);
 	thread->rng = 0x9e3779b97f4a7c15ULL ^ (u64)(u32)arg->tid;
 	spin_lock_init(&thread->lock);
+	refcount_set(&thread->live_refs, 1);
+	init_completion(&thread->live_refs_zero);
+	INIT_LIST_HEAD(&thread->node);
 	INIT_LIST_HEAD(&thread->live_node);
 
 	ret = rd_thread_setup_events(thread);
@@ -1064,21 +1582,13 @@ static int rd_register_thread_locked(struct rd_session *session,
 static int rd_unregister_thread_locked(struct rd_session *session, pid_t tid)
 {
 	struct rd_thread_ctx *thread = rd_find_active_thread_by_tid(session, tid);
-	u32 i;
 
 	if (!thread)
 		return -ENOENT;
 	if (!thread->active)
 		return 0;
 
-	for (i = 0; i < session->wp_capacity; i++) {
-		if (thread->wp_states && thread->wp_states[i] == RD_WP_ARMED)
-			thread->dropped++;
-	}
-
-	thread->active = false;
-	rd_remove_live_thread(thread);
-	rd_thread_free_live(thread);
+	rd_thread_detach_live(thread);
 	return 0;
 }
 
@@ -1092,7 +1602,19 @@ static int rd_session_config_locked(struct rd_session *session,
 		return -EBUSY;
 	if (!cfg->wp_capacity || !cfg->bp_sample_period)
 		return -EINVAL;
+	if (cfg->callchain_mode != RD_CALLCHAIN_OFF &&
+	    cfg->callchain_mode != RD_CALLCHAIN_FP &&
+	    cfg->callchain_mode != RD_CALLCHAIN_DWARF)
+		return -EINVAL;
+	if (cfg->dwarf_stack_bytes > RD_WPCTL_MAX_DWARF_STACK_BYTES)
+		return -EINVAL;
+	if (cfg->callchain_mode == RD_CALLCHAIN_DWARF &&
+	    (!cfg->dwarf_stack_bytes || !cfg->dwarf_event_capacity))
+		return -EINVAL;
 	session->wp_capacity = cfg->wp_capacity;
+	session->callchain_mode = cfg->callchain_mode;
+	session->dwarf_stack_bytes = cfg->dwarf_stack_bytes;
+	session->dwarf_event_capacity = cfg->dwarf_event_capacity;
 	session->bp_sample_period = cfg->bp_sample_period;
 	session->configured = true;
 	return 0;
@@ -1194,6 +1716,16 @@ static long rd_get_thread_stats_locked(struct rd_session *session,
 	req.hits = thread->hits;
 	req.evictions = thread->evictions;
 	req.dropped = thread->dropped;
+	req.pair_hist_used = thread->pair_hist_used;
+	req.pair_hist_dropped = thread->pair_hist_dropped;
+	req.context_used = thread->context_used;
+	req.context_dropped = thread->context_dropped;
+	req.callchain_failed = thread->callchain_failed;
+	req.callchain_truncated = thread->callchain_truncated;
+	req.dwarf_event_used = thread->dwarf_event_used;
+	req.dwarf_event_dropped = thread->dwarf_event_dropped;
+	req.dwarf_stack_copy_failed = thread->dwarf_stack_copy_failed;
+	req.dwarf_stack_bytes = thread->session->dwarf_stack_bytes;
 	spin_unlock_irqrestore(&thread->lock, flags);
 	if (copy_to_user(uarg, &req, sizeof(req)))
 		return -EFAULT;
@@ -1231,6 +1763,140 @@ static long rd_get_hist_locked(struct rd_session *session,
 	if (copy_to_user(uarg, &req, sizeof(req)))
 		return -EFAULT;
 	return 0;
+}
+
+/**
+ * @brief 返回指定线程的一条 use-reuse pair `log2` 直方图。
+ */
+static long rd_get_pair_hist_locked(struct rd_session *session,
+				    struct rd_wpctl_pair_hist_req __user *uarg)
+{
+	struct rd_wpctl_pair_hist_req req;
+	struct rd_thread_ctx *thread;
+	unsigned long flags;
+
+	if (copy_from_user(&req, uarg, sizeof(req)))
+		return -EFAULT;
+	thread = rd_find_thread_by_index(session, req.thread_index);
+	if (!thread)
+		return -ENOENT;
+	if (req.entry_index >= RD_WPCTL_MAX_PAIR_HISTS)
+		return -EINVAL;
+
+	memset(req.buckets, 0, sizeof(req.buckets));
+	req.used = 0;
+	req.seed_context_id = 0;
+	req.reuse_context_id = 0;
+	req.seed_pc_offset = 0;
+	req.reuse_pc = 0;
+
+	spin_lock_irqsave(&thread->lock, flags);
+	if (thread->pair_hist) {
+		struct rd_pair_hist_entry *entry = &thread->pair_hist[req.entry_index];
+
+		if (entry->used) {
+			req.used = 1;
+			req.seed_context_id = entry->seed_context_id;
+			req.reuse_context_id = entry->reuse_context_id;
+			req.seed_pc_offset = entry->seed_pc_offset;
+			req.reuse_pc = entry->reuse_pc;
+			memcpy(req.buckets, entry->buckets, sizeof(req.buckets));
+		}
+	}
+	spin_unlock_irqrestore(&thread->lock, flags);
+
+	if (copy_to_user(uarg, &req, sizeof(req)))
+		return -EFAULT;
+	return 0;
+}
+
+/**
+ * @brief 返回指定线程的一条调用上下文。
+ */
+static long rd_get_context_locked(struct rd_session *session,
+				  struct rd_wpctl_context_req __user *uarg)
+{
+	struct rd_wpctl_context_req req;
+	struct rd_thread_ctx *thread;
+	unsigned long flags;
+	u32 index;
+
+	if (copy_from_user(&req, uarg, sizeof(req)))
+		return -EFAULT;
+	thread = rd_find_thread_by_index(session, req.thread_index);
+	if (!thread)
+		return -ENOENT;
+	if (!req.context_id || req.context_id > RD_WPCTL_MAX_CONTEXTS)
+		return -EINVAL;
+	index = req.context_id - 1;
+
+	memset(req.ips, 0, sizeof(req.ips));
+	req.used = 0;
+	req.depth = 0;
+
+	spin_lock_irqsave(&thread->lock, flags);
+	if (thread->contexts) {
+		struct rd_context_entry *entry = &thread->contexts[index];
+
+		if (entry->used) {
+			req.used = 1;
+			req.depth = entry->depth;
+			memcpy(req.ips, entry->ips, sizeof(req.ips));
+		}
+	}
+	spin_unlock_irqrestore(&thread->lock, flags);
+
+	if (copy_to_user(uarg, &req, sizeof(req)))
+		return -EFAULT;
+	return 0;
+}
+
+/**
+ * @brief 返回指定线程的一条 DWARF raw event。
+ */
+static long rd_get_dwarf_event_locked(struct rd_session *session,
+				      struct rd_wpctl_dwarf_event_req __user *uarg)
+{
+	struct {
+		u32 thread_index;
+		u32 event_index;
+	} key;
+	struct rd_wpctl_dwarf_event_req *req;
+	struct rd_thread_ctx *thread;
+	unsigned long flags;
+	long ret = 0;
+
+	if (copy_from_user(&key, uarg, sizeof(key)))
+		return -EFAULT;
+	thread = rd_find_thread_by_index(session, key.thread_index);
+	if (!thread)
+		return -ENOENT;
+	if (key.event_index >= session->dwarf_event_capacity)
+		return -EINVAL;
+
+	req = kvzalloc(sizeof(*req), GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+	req->thread_index = key.thread_index;
+	req->event_index = key.event_index;
+
+	spin_lock_irqsave(&thread->lock, flags);
+	if (thread->dwarf_events) {
+		struct rd_wpctl_dwarf_event_req *entry =
+			&thread->dwarf_events[key.event_index];
+
+		if (entry->used) {
+			memcpy(req, entry, sizeof(*req));
+			req->thread_index = key.thread_index;
+			req->event_index = key.event_index;
+		}
+	}
+	spin_unlock_irqrestore(&thread->lock, flags);
+
+	if (copy_to_user(uarg, req, sizeof(*req)))
+		ret = -EFAULT;
+	kvfree(req);
+	return ret;
 }
 
 /**
@@ -1334,6 +2000,15 @@ static long rd_wpctl_ioctl(struct file *file, unsigned int cmd, unsigned long ar
 	case RDKIOC_GET_LOG2_HIST:
 		ret = rd_get_hist_locked(session, (void __user *)arg);
 		break;
+	case RDKIOC_GET_PAIR_HIST_ENTRY:
+		ret = rd_get_pair_hist_locked(session, (void __user *)arg);
+		break;
+	case RDKIOC_GET_CONTEXT_ENTRY:
+		ret = rd_get_context_locked(session, (void __user *)arg);
+		break;
+	case RDKIOC_GET_DWARF_EVENT:
+		ret = rd_get_dwarf_event_locked(session, (void __user *)arg);
+		break;
 	default:
 		ret = -ENOTTY;
 		break;
@@ -1376,9 +2051,9 @@ static int rd_wpctl_release(struct inode *inode, struct file *file)
 
 	mutex_lock(&session->lock);
 	list_for_each_entry_safe(thread, tmp, &session->threads, node) {
-		list_del(&thread->node);
 		if (thread->active)
-			rd_remove_live_thread(thread);
+			rd_thread_detach_live(thread);
+		list_del(&thread->node);
 		rd_thread_destroy(thread);
 	}
 	kfree(session->targets);

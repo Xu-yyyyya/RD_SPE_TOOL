@@ -96,6 +96,8 @@ def parse_hotspot_pc_offset(manifest: Path, hotspot: int) -> str:
 def parse_observed(paths: Iterable[Path], pc_offset: str | None) -> Dict[Bucket, int]:
     counts: Dict[Bucket, int] = {}
     for path in paths:
+        if path.name.endswith(".pair.hist.log2.txt"):
+            continue
         with path.open() as fh:
             header = next(fh, "").strip()
             if header != "pc_offset\tbucket_lo\tbucket_hi\tcount":
