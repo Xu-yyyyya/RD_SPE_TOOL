@@ -1,37 +1,36 @@
 #!/usr/bin/env python3
-"""Resolve ARM SPE hotspot manifests to symbols, source lines, and instructions.
+"""Resolve first-stage `.hotpc` candidates into source-oriented Markdown.
 
-Input:
-- ``.hotpc`` files emitted by the runtime hotspot aggregator.
+The report is intentionally source-first:
 
-Resolution strategy:
-1. Parse unique ``(module path, pc_offset)`` hotspot locations.
-2. Use ``addr2line`` to resolve function and source line.
-3. If line info is missing, fall back to ``nm`` and ``objdump``.
-4. Emit a readable text report to stdout or a file.
+    function -> optional loop -> source statement/expression -> source -> instruction PC
 
-Examples:
-  python3 postproc/resolve_hotspots.py /home/xya/SPE_tool/build/spe_hotspot_mainonly.hotpc
-  python3 postproc/resolve_hotspots.py /home/xya/SPE_tool/build/spe_hotspot_mainonly.hotpc \
-      --output /home/xya/SPE_tool/build/spe_hotspot_mainonly.resolved.txt
+The input `.hotpc` remains the machine-oriented interface for second-stage
+breakpoint registration.  This script only generates a human-readable
+`*.resolved.md` report for optimization review.
 """
 
 from __future__ import annotations
 
 import argparse
-import bisect
-import os
+import json
 import re
+import shlex
 import shutil
 import subprocess
-import sys
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
-_SOURCE_SUFFIXES = (".c", ".cc", ".cpp", ".cxx", ".C")
-_OMP_OUTLINED_RE = re.compile(r"^(?P<parent>.+)\._omp_fn\.(?P<index>\d+)$")
+
+SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".C", ".h", ".hh", ".hpp", ".hxx"}
+LOC_RE = re.compile(r"^(?P<file>.*?):(?P<line>\d+)(?::(?P<column>\d+))?(?:\s.*)?$")
+DISASM_RE = re.compile(
+    r"^\s*(?P<addr>[0-9a-fA-F]+):\s+"
+    r"(?:(?:[0-9a-fA-F]{2,8})\s+)+"
+    r"(?P<mnemonic>[A-Za-z0-9_.]+)\s*(?P<operands>.*)$"
+)
 
 
 @dataclass(frozen=True)
@@ -42,113 +41,254 @@ class HotspotEntry:
     module_id: int
     pc_offset: int
     path: str
+    pareto_front: int = 0
+    candidate_score: int = 0
+    candidate_metric: str = ""
+    avg_mem_latency: float = 0.0
+    lat_total_sum: int = 0
+    lat_issue_sum: int = 0
+    lat_xlat_sum: int = 0
+    lat_exec_sum: int = 0
+    l1d_refill_count: int = 0
+    llc_miss_count: int = 0
+    tlb_walk_count: int = 0
+    remote_access_count: int = 0
 
 
 @dataclass
-class AggregatedHotspot:
+class HotspotPc:
     path: str
     module_id: int
     pc_offset: int
-    total_samples: int
     entries: List[HotspotEntry]
+    sample_count_sum: int
+    candidate_score_sum: int
+    avg_mem_latency_weighted: float
+    lat_total_sum: int
+    lat_issue_sum: int
+    lat_xlat_sum: int
+    lat_exec_sum: int
+    l1d_refill_count: int
+    llc_miss_count: int
+    tlb_walk_count: int
+    remote_access_count: int
+    pareto_pc_count: int
 
 
-@dataclass
-class Symbol:
-    start: int
-    end: int
-    name: str
-    sym_type: str
-
-
-@dataclass
-class ResolvedLocation:
+@dataclass(frozen=True)
+class Frame:
     function: str
-    location: str
-    nearest_symbol: Optional[Symbol]
-    has_debug_line: bool
-    source_excerpt: List[str]
-    disassembly: List[str]
-    openmp_region: Optional["OpenMpRegion"]
+    file: str
+    line: int
+    column: int
+    raw_location: str
+
+    def source_label(self, source_root: Optional[Path]) -> str:
+        if not self.file or self.line <= 0:
+            return "unresolved"
+        path = display_path(self.file, source_root)
+        if self.column > 0:
+            return f"{path}:{self.line}:{self.column}"
+        return f"{path}:{self.line}"
+
+
+@dataclass(frozen=True)
+class InstructionInfo:
+    text: str
+    mnemonic: str
+    operands: str
+
+
+@dataclass(frozen=True)
+class LoopRegion:
+    kind: str
+    file: str
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+    depth: int
+
+    def contains(self, file: str, line: int, column: int) -> bool:
+        if normalize_path(file) != normalize_path(self.file) or line <= 0:
+            return False
+        col = column if column > 0 else 1
+        start = (self.start_line, self.start_column if self.start_column > 0 else 1)
+        end = (self.end_line, self.end_column if self.end_column > 0 else 1_000_000)
+        return start <= (line, col) <= end
+
+    def label(self, source_root: Optional[Path]) -> str:
+        return f"loop at {display_path(self.file, source_root)}:{self.start_line} ({self.kind})"
+
+
+@dataclass(frozen=True)
+class StatementRegion:
+    kind: str
+    file: str
+    start_line: int
+    start_column: int
+    end_line: int
+    end_column: int
+    text: str
+
+    def contains(self, file: str, line: int, column: int) -> bool:
+        if normalize_path(file) != normalize_path(self.file) or line <= 0:
+            return False
+        col = column if column > 0 else 1
+        start = (self.start_line, self.start_column if self.start_column > 0 else 1)
+        end = (self.end_line, self.end_column if self.end_column > 0 else 1_000_000)
+        return start <= (line, col) <= end
+
+    def label(self, source_root: Optional[Path]) -> str:
+        if self.text:
+            return f"statement: `{self.text}`"
+        loc = f"{display_path(self.file, source_root)}:{self.start_line}"
+        return f"statement at {loc}"
 
 
 @dataclass
-class OpenMpRegion:
-    source_path: str
-    parent_function: str
-    directive_line: int
-    loop_line: Optional[int]
-    region_index: int
-    total_regions: int
-    directive: str
-    summary: str
-    excerpt: List[str]
+class ResolvedHotspot:
+    pc: HotspotPc
+    frames: List[Frame]
+    instruction: Optional[InstructionInfo]
+    function: str
+    source_frame: Optional[Frame]
+    loop: Optional[LoopRegion]
+    statement: Optional[StatementRegion]
+    unresolved_reason: str = ""
+
+
+@dataclass
+class Metrics:
+    sample_count_sum: int = 0
+    candidate_score_sum: int = 0
+    latency_weighted_num: float = 0.0
+    latency_weight: int = 0
+    lat_total_sum: int = 0
+    lat_issue_sum: int = 0
+    lat_xlat_sum: int = 0
+    lat_exec_sum: int = 0
+    l1d_refill_count: int = 0
+    llc_miss_count: int = 0
+    tlb_walk_count: int = 0
+    remote_access_count: int = 0
+    pareto_pc_count: int = 0
+    pc_count: int = 0
+
+    def add(self, pc: HotspotPc) -> None:
+        self.sample_count_sum += pc.sample_count_sum
+        self.candidate_score_sum += pc.candidate_score_sum
+        self.latency_weighted_num += pc.avg_mem_latency_weighted * pc.sample_count_sum
+        self.latency_weight += pc.sample_count_sum
+        self.lat_total_sum += pc.lat_total_sum
+        self.lat_issue_sum += pc.lat_issue_sum
+        self.lat_xlat_sum += pc.lat_xlat_sum
+        self.lat_exec_sum += pc.lat_exec_sum
+        self.l1d_refill_count += pc.l1d_refill_count
+        self.llc_miss_count += pc.llc_miss_count
+        self.tlb_walk_count += pc.tlb_walk_count
+        self.remote_access_count += pc.remote_access_count
+        self.pareto_pc_count += pc.pareto_pc_count
+        self.pc_count += 1
+
+    @property
+    def avg_mem_latency_weighted(self) -> float:
+        return self.latency_weighted_num / self.latency_weight if self.latency_weight else 0.0
+
+
+def normalize_path(path: str | Path) -> str:
+    if not path:
+        return ""
+    try:
+        return str(Path(path).expanduser().resolve())
+    except OSError:
+        return str(Path(path).expanduser())
+
+
+def display_path(path: str | Path, source_root: Optional[Path]) -> str:
+    if not path:
+        return ""
+    p = Path(path)
+    if source_root:
+        try:
+            return str(p.resolve().relative_to(source_root.resolve()))
+        except Exception:
+            pass
+    return str(p)
+
+
+def path_under_root(path: str, source_root: Optional[Path]) -> bool:
+    if source_root is None or not path:
+        return False
+    try:
+        Path(path).resolve().relative_to(source_root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def parse_location(loc: str) -> Tuple[str, int, int]:
+    loc = loc.strip()
+    if loc in ("", "??:?", "??:0"):
+        return "", 0, 0
+    match = LOC_RE.match(loc)
+    if not match:
+        return loc, 0, 0
+    return match.group("file"), int(match.group("line")), int(match.group("column") or 0)
+
+
+def run_tool(args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(args, check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("hotpc", help="Path to a .hotpc manifest")
+    parser.add_argument("hotpc_pos", nargs="?", help="Path to a .hotpc manifest")
+    parser.add_argument("--hotpc", dest="hotpc_opt", help="Path to a .hotpc manifest")
+    parser.add_argument("--info", help="Path to the matching .info file")
+    parser.add_argument("--source-root", type=Path, help="Root used for source path display/filtering")
+    parser.add_argument("--compile-commands", type=Path, help="compile_commands.json for libclang AST resolution")
+    parser.add_argument("--output", "-o", type=Path, help="Output Markdown path, defaults to <hotpc stem>.resolved.md")
     parser.add_argument(
-        "--output",
-        help="Write the text report to this path instead of stdout",
+        "--filtered-hotpc",
+        type=Path,
+        help="Filtered .hotpc for targeted_rd, defaults to <hotpc stem>.filtered.hotpc",
     )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        help="Limit the report to the hottest N unique PCs",
-    )
-    parser.add_argument(
-        "--context-lines",
-        type=int,
-        default=2,
-        help="Number of source lines before/after the resolved line to show",
-    )
-    parser.add_argument(
-        "--context-bytes",
-        type=lambda s: int(s, 0),
-        default=0x10,
-        help="Instruction context size in bytes for objdump snippets",
-    )
-    parser.add_argument(
-        "--source-root",
-        default=str(Path(__file__).resolve().parent.parent),
-        help="Root directory used to heuristically search for source files",
-    )
-    return parser.parse_args(argv)
+    parser.add_argument("--top", type=int, default=50, help="Maximum children to show at each report level")
+    args = parser.parse_args(argv)
+    args.hotpc = args.hotpc_opt or args.hotpc_pos
+    if not args.hotpc:
+        parser.error("a .hotpc path is required, either positional or via --hotpc")
+    return args
 
 
-def require_tool(tool: str) -> None:
-    if shutil.which(tool) is None:
-        raise SystemExit(f"Required tool not found in PATH: {tool}")
+def parse_info(path: Optional[Path]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if path is None or not path.exists():
+        return out
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if line and "=" in line:
+                key, value = line.split("=", 1)
+                out[key] = value
+    return out
 
 
-def run_tool(args: Sequence[str]) -> str:
-    try:
-        proc = subprocess.run(args, check=True, capture_output=True, text=True)
-    except FileNotFoundError as exc:
-        raise SystemExit(f"Required tool not found: {args[0]}") from exc
-    except subprocess.CalledProcessError as exc:
-        detail = exc.stderr.strip() or exc.stdout.strip() or "command failed"
-        cmd = " ".join(args)
-        raise SystemExit(f"{cmd}: {detail}") from exc
-    return proc.stdout
-
-
-def parse_hotpc(path: str) -> Tuple[Dict[str, str], List[HotspotEntry]]:
+def parse_hotpc(path: Path) -> Tuple[Dict[str, str], List[HotspotEntry]]:
     metadata: Dict[str, str] = {}
-    hotspots: List[HotspotEntry] = []
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for raw_line in f:
+    entries: List[HotspotEntry] = []
+    with path.open(encoding="utf-8", errors="replace") as fh:
+        for raw_line in fh:
             line = raw_line.rstrip("\n")
             if not line:
                 continue
             if line.startswith("hotspot="):
-                payload = line.split("=", 1)[1]
-                parts = payload.split("\t")
-                if len(parts) != 6:
-                    raise SystemExit(f"Malformed hotspot entry in {path}: {line}")
-                hotspots.append(
+                parts = line.split("=", 1)[1].split("\t")
+                if len(parts) < 6:
+                    raise SystemExit(f"malformed hotspot entry: {line}")
+                extra = parts[6:]
+                entries.append(
                     HotspotEntry(
                         tid=int(parts[0], 10),
                         rank=int(parts[1], 10),
@@ -156,447 +296,894 @@ def parse_hotpc(path: str) -> Tuple[Dict[str, str], List[HotspotEntry]]:
                         module_id=int(parts[3], 10),
                         pc_offset=int(parts[4], 16),
                         path=parts[5],
+                        pareto_front=int(extra[0], 10) if len(extra) > 0 and extra[0] else 0,
+                        candidate_score=int(extra[1], 10) if len(extra) > 1 and extra[1] else int(parts[2], 10),
+                        candidate_metric=extra[2] if len(extra) > 2 else "sample_count",
+                        avg_mem_latency=float(extra[3]) if len(extra) > 3 and extra[3] else 0.0,
+                        lat_total_sum=int(extra[4], 10) if len(extra) > 4 and extra[4] else 0,
+                        lat_issue_sum=int(extra[5], 10) if len(extra) > 5 and extra[5] else 0,
+                        lat_xlat_sum=int(extra[6], 10) if len(extra) > 6 and extra[6] else 0,
+                        lat_exec_sum=int(extra[7], 10) if len(extra) > 7 and extra[7] else 0,
+                        l1d_refill_count=int(extra[8], 10) if len(extra) > 8 and extra[8] else 0,
+                        llc_miss_count=int(extra[9], 10) if len(extra) > 9 and extra[9] else 0,
+                        tlb_walk_count=int(extra[10], 10) if len(extra) > 10 and extra[10] else 0,
+                        remote_access_count=int(extra[11], 10) if len(extra) > 11 and extra[11] else 0,
                     )
                 )
-                continue
-            if "=" in line:
+            elif "=" in line:
                 key, value = line.split("=", 1)
                 metadata[key] = value
-    return metadata, hotspots
+    return metadata, entries
 
 
-def aggregate_hotspots(hotspots: Iterable[HotspotEntry]) -> List[AggregatedHotspot]:
+def aggregate_hotspots(entries: Iterable[HotspotEntry]) -> List[HotspotPc]:
     grouped: Dict[Tuple[str, int, int], List[HotspotEntry]] = defaultdict(list)
-    for hotspot in hotspots:
-        grouped[(hotspot.path, hotspot.module_id, hotspot.pc_offset)].append(hotspot)
+    for entry in entries:
+        grouped[(entry.path, entry.module_id, entry.pc_offset)].append(entry)
 
-    agg: List[AggregatedHotspot] = []
-    for (path, module_id, pc_offset), entries in grouped.items():
-        entries.sort(key=lambda e: (-e.sample_count, e.tid, e.rank))
-        agg.append(
-            AggregatedHotspot(
+    out: List[HotspotPc] = []
+    for (path, module_id, pc_offset), group in grouped.items():
+        sample_sum = sum(entry.sample_count for entry in group)
+        score_sum = sum(entry.candidate_score or entry.sample_count for entry in group)
+        out.append(
+            HotspotPc(
                 path=path,
                 module_id=module_id,
                 pc_offset=pc_offset,
-                total_samples=sum(entry.sample_count for entry in entries),
-                entries=entries,
+                entries=sorted(group, key=lambda e: (e.tid, e.rank)),
+                sample_count_sum=sample_sum,
+                candidate_score_sum=score_sum,
+                avg_mem_latency_weighted=(
+                    sum(entry.avg_mem_latency * entry.sample_count for entry in group) / sample_sum
+                    if sample_sum
+                    else 0.0
+                ),
+                lat_total_sum=sum(entry.lat_total_sum for entry in group),
+                lat_issue_sum=sum(entry.lat_issue_sum for entry in group),
+                lat_xlat_sum=sum(entry.lat_xlat_sum for entry in group),
+                lat_exec_sum=sum(entry.lat_exec_sum for entry in group),
+                l1d_refill_count=sum(entry.l1d_refill_count for entry in group),
+                llc_miss_count=sum(entry.llc_miss_count for entry in group),
+                tlb_walk_count=sum(entry.tlb_walk_count for entry in group),
+                remote_access_count=sum(entry.remote_access_count for entry in group),
+                pareto_pc_count=1 if any(entry.pareto_front for entry in group) else 0,
             )
         )
-    agg.sort(key=lambda h: (-h.total_samples, h.path, h.pc_offset))
-    return agg
+    out.sort(key=lambda pc: (-pc.lat_exec_sum, -pc.candidate_score_sum, -pc.sample_count_sum, pc.path, pc.pc_offset))
+    return out
 
 
-def load_module_debug_status(module_path: str) -> bool:
-    stdout = run_tool(["readelf", "-S", module_path])
-    return ".debug_line" in stdout or ".zdebug_line" in stdout
-
-
-def load_symbols(module_path: str) -> List[Symbol]:
-    stdout = run_tool(["nm", "-n", module_path])
-    raw_symbols: List[Tuple[int, str, str]] = []
-    pattern = re.compile(r"^([0-9A-Fa-f]+)\s+([A-Za-z])\s+(.+)$")
-    for line in stdout.splitlines():
-        match = pattern.match(line.strip())
-        if not match:
+def frames_from_llvm_symbolizer(binary: Path, offsets: Sequence[int]) -> Dict[int, List[Frame]]:
+    tool = shutil.which("llvm-symbolizer")
+    if not tool or not offsets:
+        return {}
+    proc = run_tool([tool, "--inlining", "--demangle", "-e", str(binary), *[hex(o) for o in offsets]])
+    if proc.returncode != 0:
+        return {}
+    groups: List[List[str]] = []
+    cur: List[str] = []
+    for line in proc.stdout.splitlines():
+        if not line.strip():
+            if cur:
+                groups.append(cur)
+                cur = []
             continue
-        addr = int(match.group(1), 16)
-        sym_type = match.group(2)
-        name = match.group(3).strip()
-        if sym_type.upper() == "U":
-            continue
-        raw_symbols.append((addr, sym_type, name))
+        cur.append(line.rstrip())
+    if cur:
+        groups.append(cur)
 
-    symbols: List[Symbol] = []
-    for i, (addr, sym_type, name) in enumerate(raw_symbols):
-        next_addr = raw_symbols[i + 1][0] if i + 1 < len(raw_symbols) else addr + 1
-        end = next_addr if next_addr > addr else addr + 1
-        symbols.append(Symbol(start=addr, end=end, name=name, sym_type=sym_type))
-    return symbols
-
-
-def find_nearest_symbol(symbols: Sequence[Symbol], pc_offset: int) -> Optional[Symbol]:
-    if not symbols:
-        return None
-    starts = [symbol.start for symbol in symbols]
-    idx = bisect.bisect_right(starts, pc_offset) - 1
-    if idx < 0:
-        return None
-    return symbols[idx]
+    out: Dict[int, List[Frame]] = {}
+    for offset, group in zip(offsets, groups):
+        frames: List[Frame] = []
+        for i in range(0, len(group), 2):
+            function = group[i].strip() if i < len(group) else "??"
+            loc = group[i + 1].strip() if i + 1 < len(group) else "??:?"
+            file, line, column = parse_location(loc)
+            frames.append(Frame(function, normalize_path(file), line, column, loc))
+        out[offset] = frames
+    return out
 
 
-def resolve_addr2line(module_path: str, offsets: Sequence[int]) -> Dict[int, Tuple[str, str]]:
+def frames_from_addr2line(binary: Path, offsets: Sequence[int]) -> Dict[int, List[Frame]]:
     if not offsets:
         return {}
-    cmd = ["addr2line", "-f", "-C", "-e", module_path]
-    cmd.extend(hex(offset) for offset in offsets)
-    stdout = run_tool(cmd)
-    lines = stdout.splitlines()
-    pairs: Dict[int, Tuple[str, str]] = {}
-    for i, offset in enumerate(offsets):
-        func = lines[2 * i].strip() if 2 * i < len(lines) else "??"
-        loc = lines[2 * i + 1].strip() if 2 * i + 1 < len(lines) else "??:?"
-        pairs[offset] = (func, loc)
-    return pairs
-
-
-def source_candidates(source_root: Path, module_path: str, parent_function: str) -> List[Path]:
-    module_stem = Path(module_path).stem.lower()
-    module_tokens = [token for token in re.split(r"[_\-\.]+", module_stem) if token]
-    parent_pat = re.compile(rf"(?m)^[^#\n;]*\b{re.escape(parent_function)}\s*\([^;{{}}]*\)\s*\{{")
-
-    ranked: List[Tuple[int, Path]] = []
-    for path in source_root.rglob("*"):
-        if not path.is_file() or path.suffix not in _SOURCE_SUFFIXES:
-            continue
-        try:
-            text = path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            continue
-        if "#pragma omp" not in text:
-            continue
-        if not parent_pat.search(text):
-            continue
-
-        stem = path.stem.lower()
-        score = 0
-        if stem == module_stem:
-            score += 100
-        if module_stem.startswith(stem) or stem.startswith(module_stem):
-            score += 60
-        if stem in module_stem or module_stem in stem:
-            score += 30
-        if stem in module_tokens:
-            score += 40
-        ranked.append((score, path))
-
-    ranked.sort(key=lambda item: (-item[0], str(item[1])))
-    return [path for _, path in ranked]
-
-
-def function_span(text: str, function_name: str) -> Optional[Tuple[int, int]]:
-    pattern = re.compile(rf"(?m)^[^#\n;]*\b{re.escape(function_name)}\s*\([^;{{}}]*\)\s*\{{")
-    match = pattern.search(text)
-    if not match:
-        return None
-
-    brace_pos = text.find("{", match.start())
-    if brace_pos < 0:
-        return None
-
-    depth = 0
-    for idx in range(brace_pos, len(text)):
-        ch = text[idx]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return brace_pos, idx
-    return None
-
-
-def summarize_openmp_region(lines: Sequence[str], pragma_idx: int) -> Tuple[Optional[int], str]:
-    summary_parts: List[str] = []
-    loop_line: Optional[int] = None
-    for idx in range(pragma_idx + 1, len(lines)):
-        stripped = lines[idx].strip()
-        if not stripped:
-            continue
-        if loop_line is None:
-            loop_line = idx + 1
-        summary_parts.append(stripped)
-        if stripped.endswith(";") or stripped.endswith("{"):
+    proc = run_tool(["addr2line", "-f", "-C", "-i", "-e", str(binary), *[hex(o) for o in offsets]])
+    if proc.returncode != 0:
+        return {}
+    lines = proc.stdout.splitlines()
+    out: Dict[int, List[Frame]] = {}
+    idx = 0
+    for offset in offsets:
+        frames: List[Frame] = []
+        while idx + 1 < len(lines):
+            function = lines[idx].strip()
+            loc = lines[idx + 1].strip()
+            idx += 2
+            file, line, column = parse_location(loc)
+            frames.append(Frame(function, normalize_path(file), line, column, loc))
+            # addr2line prints all inlined frames for one address together, but
+            # no separator.  In this repository's use cases one or two frames
+            # are enough; llvm-symbolizer is preferred for exact grouping.
             break
-        if len(summary_parts) >= 2:
-            break
-    return loop_line, " ".join(summary_parts)
+        out[offset] = frames
+    return out
 
 
-def is_outlining_omp_directive(stripped: str) -> bool:
-    if not stripped.startswith("#pragma omp"):
-        return False
-    tail = stripped[len("#pragma omp") :].strip()
-    return (
-        tail.startswith("parallel")
-        or tail.startswith("task")
-        or tail.startswith("sections")
-        or tail.startswith("teams")
-        or tail.startswith("target")
-    )
+def symbolize_module(binary: Path, offsets: Sequence[int]) -> Dict[int, List[Frame]]:
+    frames = frames_from_llvm_symbolizer(binary, offsets)
+    missing = [offset for offset in offsets if offset not in frames or not frames[offset]]
+    if missing:
+        fallback = frames_from_addr2line(binary, missing)
+        frames.update(fallback)
+    return frames
 
 
-def collect_openmp_regions(source_path: Path, parent_function: str, context_lines: int) -> List[OpenMpRegion]:
-    text = source_path.read_text(encoding="utf-8", errors="replace")
-    span = function_span(text, parent_function)
-    if span is None:
-        return []
-
-    lines = text.splitlines()
-    start_line = text.count("\n", 0, span[0]) + 1
-    end_line = text.count("\n", 0, span[1]) + 1
-    fn_lines = lines[start_line - 1 : end_line]
-
-    regions: List[OpenMpRegion] = []
-    for idx, line in enumerate(fn_lines):
-        stripped = line.lstrip()
-        if not is_outlining_omp_directive(stripped):
-            continue
-        directive_line = start_line + idx
-        loop_line, summary = summarize_openmp_region(fn_lines, idx)
-        if loop_line is not None:
-            loop_line += start_line - 1
-
-        excerpt_start = max(0, idx - context_lines)
-        excerpt_stop = min(len(fn_lines), idx + context_lines + 3)
-        excerpt: List[str] = []
-        for local_idx in range(excerpt_start, excerpt_stop):
-            line_no = start_line + local_idx
-            marker = ">" if line_no == directive_line else " "
-            excerpt.append(f"{marker} {line_no:5d}: {fn_lines[local_idx]}")
-
-        regions.append(
-            OpenMpRegion(
-                source_path=str(source_path),
-                parent_function=parent_function,
-                directive_line=directive_line,
-                loop_line=loop_line,
-                region_index=len(regions),
-                total_regions=0,
-                directive=stripped,
-                summary=summary,
-                excerpt=excerpt,
-            )
-        )
-
-    total_regions = len(regions)
-    for region in regions:
-        region.total_regions = total_regions
-    return regions
-
-
-def infer_openmp_region(
-    function_name: str,
-    module_path: str,
-    source_root: Path,
-    context_lines: int,
-) -> Optional[OpenMpRegion]:
-    match = _OMP_OUTLINED_RE.match(function_name)
-    if not match:
+def disassemble_instruction(binary: Path, offset: int) -> Optional[InstructionInfo]:
+    if not binary.exists():
         return None
-
-    parent_function = match.group("parent")
-    outline_index = int(match.group("index"), 10)
-    for source_path in source_candidates(source_root, module_path, parent_function):
-        regions = collect_openmp_regions(source_path, parent_function, context_lines)
-        if outline_index >= len(regions):
-            continue
-        source_region = regions[outline_index]
-        return OpenMpRegion(
-            source_path=source_region.source_path,
-            parent_function=source_region.parent_function,
-            directive_line=source_region.directive_line,
-            loop_line=source_region.loop_line,
-            region_index=source_region.region_index,
-            total_regions=source_region.total_regions,
-            directive=source_region.directive,
-            summary=source_region.summary,
-            excerpt=source_region.excerpt,
-        )
-    return None
-
-
-def read_source_excerpt(location: str, manifest_dir: Path, radius: int) -> List[str]:
-    if not location or location.endswith(":?") or location == "??:?":
-        return []
-    match = re.match(r"^(.*):(\d+)(?::\d+)?$", location)
-    if not match:
-        return []
-    source_name = match.group(1)
-    target_line = int(match.group(2))
-    candidates = [Path(source_name)]
-    if not os.path.isabs(source_name):
-        candidates.append(manifest_dir / source_name)
-    source_path = None
-    for candidate in candidates:
-        if candidate.exists():
-            source_path = candidate
-            break
-    if source_path is None:
-        return []
-
-    lines = source_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    start = max(1, target_line - radius)
-    stop = min(len(lines), target_line + radius)
-    excerpt: List[str] = []
-    for line_no in range(start, stop + 1):
-        marker = ">" if line_no == target_line else " "
-        excerpt.append(f"{marker} {line_no:5d}: {lines[line_no - 1]}")
-    return excerpt
-
-
-def read_disassembly(module_path: str, pc_offset: int, context_bytes: int) -> List[str]:
-    start = max(pc_offset - context_bytes, 0)
-    stop = pc_offset + context_bytes + 4
-    stdout = run_tool(
+    proc = run_tool(
         [
             "objdump",
             "-d",
-            "--demangle",
-            "--start-address",
-            hex(start),
-            "--stop-address",
-            hex(stop),
-            module_path,
+            f"--start-address=0x{offset:x}",
+            f"--stop-address=0x{offset + 4:x}",
+            str(binary),
         ]
     )
-    snippet: List[str] = []
-    inst_re = re.compile(r"^\s*([0-9A-Fa-f]+):\s+(.+)$")
-    for line in stdout.splitlines():
-        match = inst_re.match(line)
+    if proc.returncode != 0:
+        return None
+    for line in proc.stdout.splitlines():
+        match = DISASM_RE.match(line)
         if not match:
             continue
-        addr = int(match.group(1), 16)
-        marker = ">" if addr == pc_offset else " "
-        snippet.append(f"{marker} 0x{addr:x}: {match.group(2).rstrip()}")
-    return snippet
+        try:
+            addr = int(match.group("addr"), 16)
+        except ValueError:
+            continue
+        if addr != offset:
+            continue
+        mnemonic = match.group("mnemonic").lower()
+        operands = re.sub(r"\s+", " ", match.group("operands").strip())
+        text = f"{mnemonic} {operands}".strip()
+        return InstructionInfo(text=text, mnemonic=mnemonic, operands=operands)
+    return None
 
 
-def resolve_module_locations(
-    module_path: str,
-    hotspots: Sequence[AggregatedHotspot],
-    manifest_dir: Path,
-    source_root: Path,
-    context_lines: int,
-    context_bytes: int,
-) -> Dict[int, ResolvedLocation]:
-    offsets = [hotspot.pc_offset for hotspot in hotspots]
-    addr2line_info = resolve_addr2line(module_path, offsets)
-    symbols = load_symbols(module_path)
-    has_debug_line = load_module_debug_status(module_path)
+def is_callee_saved_register(reg: str) -> bool:
+    reg = reg.lower()
+    match = re.fullmatch(r"[xw](\d+)", reg)
+    if match:
+        num = int(match.group(1))
+        return 19 <= num <= 30
+    match = re.fullmatch(r"[dqv](\d+)", reg)
+    if match:
+        num = int(match.group(1))
+        return 8 <= num <= 15
+    return reg in {"fp", "lr"}
 
-    resolved: Dict[int, ResolvedLocation] = {}
-    for hotspot in hotspots:
-        function, location = addr2line_info.get(hotspot.pc_offset, ("??", "??:?"))
-        nearest_symbol = find_nearest_symbol(symbols, hotspot.pc_offset)
-        source_excerpt = read_source_excerpt(location, manifest_dir, context_lines)
-        disassembly = read_disassembly(module_path, hotspot.pc_offset, context_bytes)
-        openmp_region = infer_openmp_region(function, module_path, source_root, context_lines)
-        resolved[hotspot.pc_offset] = ResolvedLocation(
-            function=function,
-            location=location,
-            nearest_symbol=nearest_symbol,
-            has_debug_line=has_debug_line,
-            source_excerpt=source_excerpt,
-            disassembly=disassembly,
-            openmp_region=openmp_region,
+
+def stack_register_operands(instruction: InstructionInfo) -> List[str]:
+    before_memory = instruction.operands.split("[", 1)[0]
+    return re.findall(r"\b(?:[xw]\d+|[dqv]\d+|fp|lr)\b", before_memory.lower())
+
+
+def prologue_epilogue_reason(instruction: Optional[InstructionInfo]) -> str:
+    """Classify compiler stack-frame save/restore instructions."""
+    if instruction is None:
+        return ""
+    if instruction.mnemonic not in {"stp", "ldp", "str", "ldr", "stur", "ldur"}:
+        return ""
+    if not re.search(r"\[sp(?:,|\])", instruction.operands.lower()):
+        return ""
+    regs = stack_register_operands(instruction)
+    if not regs or not all(is_callee_saved_register(reg) for reg in regs):
+        return ""
+    if instruction.mnemonic.startswith("st"):
+        return "function_prologue_callee_saved_spill"
+    return "function_epilogue_callee_saved_restore"
+
+
+def import_clang_cindex():
+    try:
+        from clang import cindex  # type: ignore
+    except ImportError as exc:
+        raise SystemExit("libclang source attribution requires Python clang bindings") from exc
+    for candidate in (
+        "/usr/lib/llvm-14/lib/libclang.so.1",
+        "/usr/lib/llvm-14/lib/libclang-14.so.1",
+        "/usr/lib/aarch64-linux-gnu/libclang-14.so.1",
+    ):
+        if Path(candidate).exists():
+            try:
+                cindex.Config.set_library_file(candidate)
+            except Exception:
+                pass
+            break
+    try:
+        cindex.Index.create()
+    except Exception as exc:
+        raise SystemExit(f"failed to initialize libclang: {exc}") from exc
+    return cindex
+
+
+def load_compile_commands(path: Optional[Path]) -> List[dict]:
+    if path is None:
+        return []
+    with path.open(encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise SystemExit("compile_commands.json must be a JSON array")
+    return data
+
+
+def command_arguments(entry: dict) -> List[str]:
+    if isinstance(entry.get("arguments"), list):
+        return list(entry["arguments"])
+    if entry.get("command"):
+        return shlex.split(entry["command"])
+    return []
+
+
+def gcc_include_dir() -> Optional[str]:
+    gcc = shutil.which("g++") or shutil.which("gcc")
+    if not gcc:
+        return None
+    proc = run_tool([gcc, "-print-file-name=include"])
+    path = proc.stdout.strip() if proc.returncode == 0 else ""
+    return path if path and Path(path).is_dir() else None
+
+
+def filtered_clang_args(entry: dict, source_file: str) -> List[str]:
+    raw = command_arguments(entry)
+    if raw:
+        raw = raw[1:]
+    directory = Path(entry.get("directory", "."))
+    out: List[str] = []
+    skip_next = False
+    source_name = Path(source_file).name
+    for arg in raw:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in {"-o", "-MF", "-MT", "-MQ", "-include-pch"}:
+            skip_next = True
+            continue
+        arg_path = Path(arg)
+        if arg == "-c" or (
+            not arg.startswith("-")
+            and arg_path.name == source_name
+            and arg_path.suffix in {".c", ".cc", ".cpp", ".cxx", ".C"}
+        ):
+            continue
+        if arg.startswith("-I") and len(arg) > 2:
+            include_path = Path(arg[2:])
+            if not include_path.is_absolute():
+                arg = "-I" + normalize_path(directory / include_path)
+        if arg.startswith("-o") and arg != "-ObjC":
+            continue
+        if arg in {"-MMD", "-MD", "-MP"}:
+            continue
+        if arg.startswith("-march=") or arg.startswith("-mcpu=") or arg.startswith("-mtune="):
+            continue
+        out.append(arg)
+    if not any(arg.startswith("-std=") for arg in out):
+        out.append("-std=c++17")
+    if any(arg == "-fopenmp" or arg.startswith("-fopenmp=") for arg in out):
+        include_dir = gcc_include_dir()
+        if include_dir and f"-I{include_dir}" not in out:
+            out.append(f"-I{include_dir}")
+    return out
+
+
+def compile_entry_for_file(entries: Sequence[dict], source: str) -> Optional[dict]:
+    src_norm = normalize_path(source)
+    src_base = Path(source).name
+    for entry in entries:
+        directory = Path(entry.get("directory", "."))
+        file_value = Path(entry.get("file", ""))
+        if not file_value.is_absolute():
+            file_value = directory / file_value
+        if normalize_path(file_value) == src_norm:
+            return entry
+    for entry in entries:
+        if Path(entry.get("file", "")).name == src_base:
+            return entry
+    return None
+
+
+def cursor_kind_name(kind) -> str:
+    text = str(kind)
+    return text.split(".")[-1] if "." in text else text
+
+
+def loop_kind(cindex, kind) -> Optional[str]:
+    if kind == cindex.CursorKind.FOR_STMT:
+        return "for"
+    if kind == cindex.CursorKind.WHILE_STMT:
+        return "while"
+    if kind == cindex.CursorKind.DO_STMT:
+        return "do"
+    if hasattr(cindex.CursorKind, "CXX_FOR_RANGE_STMT") and kind == cindex.CursorKind.CXX_FOR_RANGE_STMT:
+        return "range_for"
+    return None
+
+
+def is_statement_kind(cindex, kind) -> bool:
+    wanted_names = {
+        "DECL_STMT",
+        "BINARY_OPERATOR",
+        "COMPOUND_ASSIGNMENT_OPERATOR",
+        "CALL_EXPR",
+        "ARRAY_SUBSCRIPT_EXPR",
+        "RETURN_STMT",
+        "IF_STMT",
+        "FOR_STMT",
+        "WHILE_STMT",
+        "DO_STMT",
+        "CXX_FOR_RANGE_STMT",
+        "UNARY_OPERATOR",
+        "ASM_STMT",
+    }
+    return cursor_kind_name(kind) in wanted_names
+
+
+def read_source_range(path: str, start_line: int, start_col: int, end_line: int, end_col: int) -> str:
+    try:
+        lines = Path(path).read_text(encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return ""
+    if start_line <= 0 or end_line <= 0 or start_line > len(lines):
+        return ""
+    end_line = min(end_line, len(lines))
+    if start_line == end_line:
+        text = lines[start_line - 1]
+        start = max(start_col - 1, 0)
+        end = max(end_col - 1, start)
+        snippet = text[start:end].strip() or text.strip()
+    else:
+        snippet = " ".join(line.strip() for line in lines[start_line - 1 : end_line])
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+    return snippet[:180] + ("..." if len(snippet) > 180 else "")
+
+
+def source_statement_fragment(frame: Frame) -> str:
+    """Return a readable source statement fragment around a debug line column."""
+    try:
+        lines = Path(frame.file).read_text(encoding="utf-8", errors="replace").split("\n")
+    except OSError:
+        return ""
+    if frame.line <= 0 or frame.line > len(lines):
+        return ""
+    line = lines[frame.line - 1]
+    stripped = line.strip()
+    if not stripped or stripped in ("{", "}", "};"):
+        return ""
+    col = min(max(frame.column - 1, 0), max(len(line) - 1, 0))
+    if_fragment = split_single_line_if_fragment(line, col)
+    if if_fragment:
+        return if_fragment
+    starts = [line.rfind(token, 0, col + 1) for token in (";", "{", "}")]
+    start = max(starts)
+    start = start + 1 if start >= 0 else 0
+    ends = [idx for idx in (line.find(";", col), line.find("{", col), line.find("}", col)) if idx >= 0]
+    end = min(ends) + 1 if ends else len(line)
+    snippet = line[start:end].strip()
+    if snippet in ("", "{", "}", "};"):
+        return ""
+    snippet = re.sub(r"\s+", " ", snippet).strip()
+    return snippet[:180] + ("..." if len(snippet) > 180 else "")
+
+
+def split_single_line_if_fragment(line: str, col: int) -> str:
+    """Split `if (cond) stmt;` lines so one PC maps to condition or body."""
+    match = re.search(r"\bif\s*\(", line)
+    if not match:
+        return ""
+    open_idx = line.find("(", match.start())
+    if open_idx < 0:
+        return ""
+    depth = 0
+    close_idx = -1
+    for idx in range(open_idx, len(line)):
+        ch = line[idx]
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                close_idx = idx
+                break
+    if close_idx < 0:
+        return ""
+    if col <= close_idx:
+        condition = line[open_idx + 1 : close_idx].strip()
+        return f"if condition: {re.sub(r'\\s+', ' ', condition)}" if condition else ""
+    body = line[close_idx + 1 :].strip()
+    return re.sub(r"\s+", " ", body)[:180] if body and body not in ("{", "}") else ""
+
+
+def extract_ast_regions(
+    source_files: Iterable[str],
+    compile_commands: Optional[Path],
+    source_root: Optional[Path],
+) -> Tuple[List[LoopRegion], List[StatementRegion], List[str]]:
+    if compile_commands is None:
+        return [], [], ["compile_commands not provided; loop/statement attribution disabled"]
+    cindex = import_clang_cindex()
+    entries = load_compile_commands(compile_commands)
+    index = cindex.Index.create()
+    loops: List[LoopRegion] = []
+    statements: List[StatementRegion] = []
+    diagnostics: List[str] = []
+    wanted_sources = {normalize_path(s) for s in source_files if s and Path(s).exists()}
+    source_root_norm = normalize_path(source_root) if source_root else ""
+    seen_tus = set()
+
+    for source in sorted(wanted_sources):
+        entry = compile_entry_for_file(entries, source)
+        if entry is None:
+            diagnostics.append(f"no compile command for {source}")
+            continue
+        tu_file = Path(entry.get("file", source))
+        if not tu_file.is_absolute():
+            tu_file = Path(entry.get("directory", ".")) / tu_file
+        tu_file_norm = normalize_path(tu_file)
+        if tu_file_norm in seen_tus:
+            continue
+        seen_tus.add(tu_file_norm)
+        try:
+            tu = index.parse(tu_file_norm, args=filtered_clang_args(entry, tu_file_norm), options=0)
+        except Exception as exc:
+            diagnostics.append(f"failed to parse {tu_file_norm}: {exc}")
+            continue
+        diagnostics.extend(str(diag) for diag in tu.diagnostics)
+
+        def in_scope(file_norm: str) -> bool:
+            if file_norm in wanted_sources:
+                return True
+            return bool(source_root_norm and file_norm.startswith(source_root_norm + "/"))
+
+        def visit(cursor, depth: int) -> None:
+            start = cursor.extent.start
+            end = cursor.extent.end
+            if start.file and end.file:
+                file_norm = normalize_path(str(start.file))
+                if in_scope(file_norm):
+                    lk = loop_kind(cindex, cursor.kind)
+                    if lk:
+                        loops.append(
+                            LoopRegion(
+                                kind=lk,
+                                file=file_norm,
+                                start_line=start.line,
+                                start_column=start.column,
+                                end_line=end.line,
+                                end_column=end.column,
+                                depth=depth,
+                            )
+                        )
+                    if is_statement_kind(cindex, cursor.kind):
+                        statements.append(
+                            StatementRegion(
+                                kind=cursor_kind_name(cursor.kind),
+                                file=file_norm,
+                                start_line=start.line,
+                                start_column=start.column,
+                                end_line=end.line,
+                                end_column=end.column,
+                                text=read_source_range(file_norm, start.line, start.column, end.line, end.column),
+                            )
+                        )
+            for child in cursor.get_children():
+                visit(child, depth + 1)
+
+        visit(tu.cursor, 0)
+    return loops, statements, diagnostics
+
+
+def innermost_loop(frame: Frame, loops_by_file: Dict[str, List[LoopRegion]]) -> Optional[LoopRegion]:
+    candidates = [loop for loop in loops_by_file.get(normalize_path(frame.file), []) if loop.contains(frame.file, frame.line, frame.column)]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda loop: (loop.depth, -(loop.end_line - loop.start_line), loop.start_line))
+
+
+def nearest_statement(frame: Frame, stmts_by_file: Dict[str, List[StatementRegion]]) -> Optional[StatementRegion]:
+    candidates = [stmt for stmt in stmts_by_file.get(normalize_path(frame.file), []) if stmt.contains(frame.file, frame.line, frame.column)]
+    if not candidates:
+        return None
+    return min(
+        candidates,
+        key=lambda stmt: (
+            stmt.end_line - stmt.start_line,
+            stmt.end_column - stmt.start_column,
+            -len(stmt.kind),
+        ),
+    )
+
+
+def choose_source_frame(frames: Sequence[Frame], source_root: Optional[Path]) -> Optional[Frame]:
+    valid = [f for f in frames if f.file and f.line > 0 and Path(f.file).exists()]
+    if source_root:
+        for frame in valid:
+            if path_under_root(frame.file, source_root):
+                return frame
+    return valid[0] if valid else None
+
+
+def resolve_hotspots(
+    pcs: Sequence[HotspotPc],
+    source_root: Optional[Path],
+    compile_commands: Optional[Path],
+) -> Tuple[List[ResolvedHotspot], List[str]]:
+    by_module: Dict[str, List[HotspotPc]] = defaultdict(list)
+    for pc in pcs:
+        by_module[pc.path].append(pc)
+
+    frames_by_key: Dict[Tuple[str, int], List[Frame]] = {}
+    instructions_by_key: Dict[Tuple[str, int], Optional[InstructionInfo]] = {}
+    for module, module_pcs in by_module.items():
+        binary = Path(module)
+        if not binary.exists():
+            for pc in module_pcs:
+                frames_by_key[(module, pc.pc_offset)] = []
+                instructions_by_key[(module, pc.pc_offset)] = None
+            continue
+        offsets = [pc.pc_offset for pc in module_pcs]
+        symbolized = symbolize_module(binary, offsets)
+        for pc in module_pcs:
+            frames_by_key[(module, pc.pc_offset)] = symbolized.get(pc.pc_offset, [])
+            instructions_by_key[(module, pc.pc_offset)] = disassemble_instruction(binary, pc.pc_offset)
+
+    source_files = set()
+    for frames in frames_by_key.values():
+        for frame in frames:
+            if not (frame.file and frame.line > 0 and Path(frame.file).exists()):
+                continue
+            if source_root and not path_under_root(frame.file, source_root):
+                continue
+            source_files.add(frame.file)
+    loops, statements, diagnostics = extract_ast_regions(source_files, compile_commands, source_root)
+    loops_by_file: Dict[str, List[LoopRegion]] = defaultdict(list)
+    statements_by_file: Dict[str, List[StatementRegion]] = defaultdict(list)
+    for loop in loops:
+        loops_by_file[normalize_path(loop.file)].append(loop)
+    for stmt in statements:
+        statements_by_file[normalize_path(stmt.file)].append(stmt)
+
+    resolved: List[ResolvedHotspot] = []
+    for pc in pcs:
+        frames = frames_by_key.get((pc.path, pc.pc_offset), [])
+        instruction = instructions_by_key.get((pc.path, pc.pc_offset))
+        usable = [f for f in frames if f.function and f.function != "??"]
+        source_frame = choose_source_frame(frames, source_root)
+        function = (
+            source_frame.function
+            if source_frame and source_frame.function and source_frame.function != "??"
+            else (usable[0].function if usable else f"{Path(pc.path).name}+0x{pc.pc_offset:x}")
         )
-    return resolved
-
-
-def format_symbol_delta(symbol: Optional[Symbol], pc_offset: int) -> str:
-    if symbol is None:
-        return "??"
-    delta = pc_offset - symbol.start
-    end = symbol.end if symbol.end > symbol.start else symbol.start + 1
-    return f"{symbol.name} + 0x{delta:x} (0x{symbol.start:x}-0x{end:x})"
-
-
-def build_report(
-    hotpc_path: str,
-    metadata: Dict[str, str],
-    hotspots: Sequence[AggregatedHotspot],
-    resolved_by_module: Dict[str, Dict[int, ResolvedLocation]],
-) -> str:
-    lines: List[str] = []
-    lines.append(f"manifest: {hotpc_path}")
-    if "hotspot_scope" in metadata:
-        lines.append(f"hotspot_scope: {metadata['hotspot_scope']}")
-    if "hotspot_main_binary" in metadata:
-        lines.append(f"hotspot_main_binary: {metadata['hotspot_main_binary']}")
-    lines.append(f"unique_hotspots: {len(hotspots)}")
-    lines.append(f"per_thread_entries: {sum(len(hotspot.entries) for hotspot in hotspots)}")
-
-    for idx, hotspot in enumerate(hotspots, start=1):
-        resolved = resolved_by_module[hotspot.path][hotspot.pc_offset]
-        seen_in = ", ".join(
-            f"tid={entry.tid}/rank={entry.rank}/count={entry.sample_count}"
-            for entry in hotspot.entries
-        )
-        lines.append("")
-        lines.append(f"[{idx}] {hotspot.path} +0x{hotspot.pc_offset:x}")
-        lines.append(f"  total_samples: {hotspot.total_samples}")
-        lines.append(f"  seen_in: {seen_in}")
-        lines.append(f"  function: {resolved.function}")
-        lines.append(f"  source: {resolved.location}")
-        lines.append(f"  nearest_symbol: {format_symbol_delta(resolved.nearest_symbol, hotspot.pc_offset)}")
-        lines.append(f"  debug_line_info: {'yes' if resolved.has_debug_line else 'no'}")
-        if resolved.openmp_region is not None:
-            omp = resolved.openmp_region
-            lines.append("  openmp_region_inference:")
-            lines.append(f"    parent_function: {omp.parent_function}")
-            lines.append(f"    source_file: {omp.source_path}")
-            lines.append(f"    pragma_line: {omp.directive_line}")
-            if omp.loop_line is not None:
-                lines.append(f"    loop_line: {omp.loop_line}")
-            lines.append(f"    directive: {omp.directive}")
-            lines.append(f"    summary: {omp.summary or '(no loop summary)'}")
-            lines.append(
-                f"    mapping_rule: gcc usually numbers ._omp_fn.N workers in source order within the parent function"
+        loop = innermost_loop(source_frame, loops_by_file) if source_frame else None
+        statement = nearest_statement(source_frame, statements_by_file) if source_frame else None
+        statement_fragment = source_statement_fragment(source_frame) if source_frame else ""
+        reason = ""
+        if source_frame is None:
+            reason = "source_unresolved"
+        elif statement is None:
+            reason = "statement_unresolved"
+        filtered_reason = prologue_epilogue_reason(instruction)
+        if not filtered_reason and source_frame is None:
+            filtered_reason = "source_unresolved"
+        if not filtered_reason and not statement_fragment:
+            filtered_reason = "non_source_statement"
+        if filtered_reason:
+            source = source_frame.source_label(source_root) if source_frame else "unresolved"
+            instruction_text = instruction.text if instruction else "unknown"
+            diagnostics.append(
+                "filtered "
+                f"{filtered_reason}: pc=0x{pc.pc_offset:x} "
+                f"samples={pc.sample_count_sum} source={source} instruction={instruction_text}"
             )
-            if omp.excerpt:
-                lines.append("  openmp_region_excerpt:")
-                lines.extend(f"    {line}" for line in omp.excerpt)
-        if resolved.source_excerpt:
-            lines.append("  source_excerpt:")
-            lines.extend(f"    {line}" for line in resolved.source_excerpt)
-        if resolved.disassembly:
-            lines.append("  disassembly:")
-            lines.extend(f"    {line}" for line in resolved.disassembly)
-    lines.append("")
-    return "\n".join(lines)
+            continue
+        resolved.append(ResolvedHotspot(pc, frames, instruction, function, source_frame, loop, statement, reason))
+    return resolved, diagnostics
+
+
+def metrics_for(items: Sequence[ResolvedHotspot]) -> Metrics:
+    metrics = Metrics()
+    for item in items:
+        metrics.add(item.pc)
+    return metrics
+
+
+def metrics_lines(metrics: Metrics) -> List[str]:
+    return [
+        f"- sample_count_sum: {metrics.sample_count_sum}",
+        f"- candidate_score_sum: {metrics.candidate_score_sum}",
+        f"- avg_mem_latency_weighted: {metrics.avg_mem_latency_weighted:.6g}",
+        f"- lat_total_sum: {metrics.lat_total_sum}",
+        f"- lat_issue_sum: {metrics.lat_issue_sum}",
+        f"- lat_xlat_sum: {metrics.lat_xlat_sum}",
+        f"- lat_exec_sum: {metrics.lat_exec_sum}",
+        f"- l1d_refill_count: {metrics.l1d_refill_count}",
+        f"- llc_miss_count: {metrics.llc_miss_count}",
+        f"- tlb_walk_count: {metrics.tlb_walk_count}",
+        f"- remote_access_count: {metrics.remote_access_count}",
+        f"- pareto_pc_count: {metrics.pareto_pc_count}",
+        f"- pc_count: {metrics.pc_count}",
+    ]
+
+
+def sort_items(items: Iterable[ResolvedHotspot]) -> List[ResolvedHotspot]:
+    return sorted(
+        items,
+        key=lambda item: (
+            -item.pc.lat_exec_sum,
+            -item.pc.candidate_score_sum,
+            -item.pc.sample_count_sum,
+            item.pc.path,
+            item.pc.pc_offset,
+        ),
+    )
+
+
+def group_key_loop(item: ResolvedHotspot, source_root: Optional[Path]) -> str:
+    return item.loop.label(source_root) if item.loop else "(no loop)"
+
+
+def group_key_statement(item: ResolvedHotspot, source_root: Optional[Path]) -> str:
+    if item.source_frame:
+        fragment = source_statement_fragment(item.source_frame)
+        if fragment:
+            return f"statement: `{fragment}`"
+        return "(no expression statement on resolved line)"
+    if item.statement:
+        return item.statement.label(source_root)
+    if item.unresolved_reason:
+        return f"({item.unresolved_reason})"
+    return "(statement unresolved)"
+
+
+def group_key_source(item: ResolvedHotspot, source_root: Optional[Path]) -> str:
+    return item.source_frame.source_label(source_root) if item.source_frame else "unresolved"
+
+
+def tree_indent(depth: int, is_last: bool) -> str:
+    if depth <= 0:
+        return ""
+    return "    " * (depth - 1) + ("└── " if is_last else "├── ")
+
+
+def write_tree_line(out, depth: int, is_last: bool, label: str) -> None:
+    out.write(f"{tree_indent(depth, is_last)}{label}\n")
+
+
+def pc_label(item: ResolvedHotspot) -> str:
+    rank = item.pc.entries[0].rank
+    return f"[P{rank:02d}] pc=0x{item.pc.pc_offset:x}, samples={item.pc.sample_count_sum}"
+
+
+def write_attribution_tree(
+    out,
+    resolved: Sequence[ResolvedHotspot],
+    source_root: Optional[Path],
+    top: int,
+) -> None:
+    by_function: Dict[str, List[ResolvedHotspot]] = defaultdict(list)
+    for item in resolved:
+        by_function[item.function].append(item)
+
+    out.write("## Hotspot Attribution Tree\n\n")
+    out.write("```text\n")
+    out.write("<program root>\n")
+    sorted_functions = sorted(
+        by_function.items(),
+        key=lambda kv: (-metrics_for(kv[1]).lat_exec_sum, -metrics_for(kv[1]).sample_count_sum, kv[0]),
+    )[:top]
+    for fn_idx, (function, fn_items) in enumerate(sorted_functions):
+        fn_last = fn_idx == len(sorted_functions) - 1
+        write_tree_line(out, 1, fn_last, function)
+        by_loop: Dict[str, List[ResolvedHotspot]] = defaultdict(list)
+        for item in fn_items:
+            by_loop[group_key_loop(item, source_root)].append(item)
+        sorted_loops = sorted(
+            by_loop.items(),
+            key=lambda kv: (-metrics_for(kv[1]).lat_exec_sum, -metrics_for(kv[1]).sample_count_sum, kv[0]),
+        )[:top]
+        for loop_idx, (loop_label, loop_items) in enumerate(sorted_loops):
+            loop_last = loop_idx == len(sorted_loops) - 1
+            if loop_label != "(no loop)":
+                write_tree_line(out, 2, loop_last, loop_label)
+                stmt_depth = 3
+                source_depth = 4
+                pc_depth = 5
+            else:
+                stmt_depth = 2
+                source_depth = 3
+                pc_depth = 4
+
+            by_stmt: Dict[str, List[ResolvedHotspot]] = defaultdict(list)
+            for item in loop_items:
+                by_stmt[group_key_statement(item, source_root)].append(item)
+            sorted_stmts = sorted(
+                by_stmt.items(),
+                key=lambda kv: (-metrics_for(kv[1]).lat_exec_sum, -metrics_for(kv[1]).sample_count_sum, kv[0]),
+            )[:top]
+            for stmt_idx, (stmt_label, stmt_items) in enumerate(sorted_stmts):
+                stmt_last = stmt_idx == len(sorted_stmts) - 1
+                write_tree_line(out, stmt_depth, stmt_last, stmt_label)
+                by_source: Dict[str, List[ResolvedHotspot]] = defaultdict(list)
+                for item in stmt_items:
+                    by_source[group_key_source(item, source_root)].append(item)
+                sorted_sources = sorted(by_source.items(), key=lambda kv: kv[0])[:top]
+                for src_idx, (source_label, source_items) in enumerate(sorted_sources):
+                    src_last = src_idx == len(sorted_sources) - 1
+                    write_tree_line(out, source_depth, src_last, source_label)
+                    pcs = sort_items(source_items)
+                    for pc_idx, item in enumerate(pcs):
+                        write_tree_line(out, pc_depth, pc_idx == len(pcs) - 1, pc_label(item))
+    out.write("```\n\n")
+
+
+def write_metrics_table(out, resolved: Sequence[ResolvedHotspot], source_root: Optional[Path]) -> None:
+    out.write("## Instruction Metrics\n\n")
+    out.write(
+        "| id | rank | pc_offset | module | function | source | sample_count | avg_mem_latency | "
+        "lat_exec_sum | pareto_front | l1d_refill | llc_miss | tlb_walk | remote_access |\n"
+    )
+    out.write("|---|---:|---:|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|\n")
+    for item in sort_items(resolved):
+        pc = item.pc
+        rank = pc.entries[0].rank
+        source = group_key_source(item, source_root)
+        out.write(
+            f"| P{rank:02d} | {rank} | 0x{pc.pc_offset:x} | {Path(pc.path).name} | "
+            f"{item.function} | {source} | {pc.sample_count_sum} | "
+            f"{pc.avg_mem_latency_weighted:.6g} | {pc.lat_exec_sum} | {pc.pareto_pc_count} | "
+            f"{pc.l1d_refill_count} | {pc.llc_miss_count} | {pc.tlb_walk_count} | {pc.remote_access_count} |\n"
+        )
+    out.write("\n")
+
+    out.write("## Inline Chains And Unresolved Notes\n\n")
+    for item in sort_items(resolved):
+        rank = item.pc.entries[0].rank
+        if item.frames:
+            chain = " -> ".join(frame.source_label(source_root) for frame in item.frames)
+            out.write(f"- P{rank:02d} inline_chain: `{chain}`\n")
+        if item.unresolved_reason:
+            out.write(f"- P{rank:02d} unresolved: `{item.unresolved_reason}`\n")
+    out.write("\n")
+
+
+def write_report(
+    path: Path,
+    hotpc_path: Path,
+    info_path: Optional[Path],
+    filtered_hotpc_path: Path,
+    resolved: Sequence[ResolvedHotspot],
+    diagnostics: Sequence[str],
+    source_root: Optional[Path],
+    top: int,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", encoding="utf-8") as out:
+        out.write("# Hotspot Source Attribution Report\n\n")
+        out.write(f"- hotpc: `{hotpc_path}`\n")
+        out.write(f"- filtered_hotpc: `{filtered_hotpc_path}`\n")
+        if info_path:
+            out.write(f"- info: `{info_path}`\n")
+        if source_root:
+            out.write(f"- source_root: `{source_root}`\n")
+        out.write(f"- unique_instruction_pcs: {len(resolved)}\n\n")
+        if diagnostics:
+            out.write("## Attribution Diagnostics\n\n")
+            for diag in diagnostics[:30]:
+                out.write(f"- `{diag}`\n")
+            out.write("\n")
+        write_attribution_tree(out, resolved, source_root, top)
+        write_metrics_table(out, resolved, source_root)
+
+
+def filtered_hotspot_keys(resolved: Sequence[ResolvedHotspot]) -> set[Tuple[str, int, int]]:
+    return {(item.pc.path, item.pc.module_id, item.pc.pc_offset) for item in resolved}
+
+
+def hotspot_entry_line(entry: HotspotEntry, rank: int) -> str:
+    return (
+        "hotspot="
+        f"{entry.tid}\t"
+        f"{rank}\t"
+        f"{entry.sample_count}\t"
+        f"{entry.module_id}\t"
+        f"0x{entry.pc_offset:x}\t"
+        f"{entry.path}\t"
+        f"{entry.pareto_front}\t"
+        f"{entry.candidate_score}\t"
+        f"{entry.candidate_metric}\t"
+        f"{entry.avg_mem_latency:.6g}\t"
+        f"{entry.lat_total_sum}\t"
+        f"{entry.lat_issue_sum}\t"
+        f"{entry.lat_xlat_sum}\t"
+        f"{entry.lat_exec_sum}\t"
+        f"{entry.l1d_refill_count}\t"
+        f"{entry.llc_miss_count}\t"
+        f"{entry.tlb_walk_count}\t"
+        f"{entry.remote_access_count}"
+    )
+
+
+def write_filtered_hotpc(
+    path: Path,
+    original_hotpc: Path,
+    metadata: Dict[str, str],
+    entries: Sequence[HotspotEntry],
+    resolved: Sequence[ResolvedHotspot],
+) -> None:
+    keep = filtered_hotspot_keys(resolved)
+    filtered = [
+        entry
+        for entry in entries
+        if (entry.path, entry.module_id, entry.pc_offset) in keep
+    ]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    meta = dict(metadata)
+    meta["hotspot_filter"] = "source_statement_valid"
+    meta["hotspot_filter_input"] = str(original_hotpc)
+    meta["hotspot_filter_removed_count"] = str(len(entries) - len(filtered))
+    meta["hotspot_count"] = str(len(filtered))
+    meta["hotspot_fields"] = (
+        "tid,rank,sample_count,module_id,pc_offset,path,pareto_front,candidate_score,"
+        "candidate_metric,avg_mem_latency,lat_total_sum,lat_issue_sum,lat_xlat_sum,"
+        "lat_exec_sum,l1d_refill_count,llc_miss_count,tlb_walk_count,remote_access_count"
+    )
+    with path.open("w", encoding="utf-8") as out:
+        for key in sorted(meta):
+            out.write(f"{key}={meta[key]}\n")
+        by_tid: Dict[int, List[HotspotEntry]] = defaultdict(list)
+        for entry in filtered:
+            by_tid[entry.tid].append(entry)
+        for tid in sorted(by_tid):
+            ranked = sorted(by_tid[tid], key=lambda entry: (entry.rank, -entry.lat_exec_sum, entry.pc_offset))
+            for rank, entry in enumerate(ranked, 1):
+                out.write(hotspot_entry_line(entry, rank) + "\n")
+
+
+def default_output_path(hotpc: Path) -> Path:
+    name = hotpc.name
+    if name.endswith(".hotpc"):
+        return hotpc.with_name(name[: -len(".hotpc")] + ".resolved.md")
+    return hotpc.with_suffix(".resolved.md")
+
+
+def default_filtered_hotpc_path(hotpc: Path) -> Path:
+    name = hotpc.name
+    if name.endswith(".hotpc"):
+        return hotpc.with_name(name[: -len(".hotpc")] + ".filtered.hotpc")
+    return hotpc.with_suffix(".filtered.hotpc")
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
+    hotpc_path = Path(args.hotpc).resolve()
+    info_path = Path(args.info).resolve() if args.info else None
+    source_root = args.source_root.resolve() if args.source_root else None
+    output_path = args.output or default_output_path(hotpc_path)
+    filtered_hotpc_path = args.filtered_hotpc or default_filtered_hotpc_path(hotpc_path)
 
-    for tool in ("addr2line", "readelf", "nm", "objdump"):
-        require_tool(tool)
-
-    hotpc_path = os.path.abspath(args.hotpc)
-    manifest_dir = Path(hotpc_path).parent
-    source_root = Path(args.source_root).resolve()
     metadata, entries = parse_hotpc(hotpc_path)
     if not entries:
-        raise SystemExit(f"No hotspot entries found in {hotpc_path}")
+        raise SystemExit(f"no hotspot entries found in {hotpc_path}")
+    # Keep metadata parsing intentionally active; future report versions can
+    # surface extra provenance without changing the core parser.
+    _ = metadata
+    _ = parse_info(info_path)
 
-    hotspots = aggregate_hotspots(entries)
-    if args.limit is not None:
-        hotspots = hotspots[: args.limit]
-
-    hotspots_by_module: Dict[str, List[AggregatedHotspot]] = defaultdict(list)
-    for hotspot in hotspots:
-        hotspots_by_module[hotspot.path].append(hotspot)
-
-    resolved_by_module: Dict[str, Dict[int, ResolvedLocation]] = {}
-    for module_path, module_hotspots in hotspots_by_module.items():
-        if not os.path.exists(module_path):
-            raise SystemExit(f"Module path from manifest does not exist: {module_path}")
-        resolved_by_module[module_path] = resolve_module_locations(
-            module_path,
-            module_hotspots,
-            manifest_dir,
-            source_root,
-            args.context_lines,
-            args.context_bytes,
-        )
-
-    report = build_report(hotpc_path, metadata, hotspots, resolved_by_module)
-    if args.output:
-        out_path = Path(args.output)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_text(report, encoding="utf-8")
-    else:
-        sys.stdout.write(report)
+    pcs = aggregate_hotspots(entries)
+    resolved, diagnostics = resolve_hotspots(pcs, source_root, args.compile_commands)
+    write_filtered_hotpc(filtered_hotpc_path, hotpc_path, metadata, entries, resolved)
+    write_report(output_path, hotpc_path, info_path, filtered_hotpc_path, resolved, diagnostics, source_root, args.top)
+    print(f"wrote {output_path}")
+    print(f"wrote {filtered_hotpc_path}")
     return 0
 
 

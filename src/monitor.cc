@@ -12,7 +12,9 @@
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <asm/perf_regs.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sched.h>
@@ -31,9 +33,17 @@
 #define PAGE_SIZE (sysconf(_SC_PAGESIZE))
 
 #define EVENTFD_TOKEN 0U
+#define SAMPLER_TOKEN_KIND 1ULL
+#define COST_TOKEN_KIND 2ULL
 #define SAMPLER_DRAIN 1
 #define SAMPLER_STOP 2
-#define DEFAULT_HOTSPOT_TOP_K 4
+#define DEFAULT_HOTSPOT_TOP_K 12
+#define DEFAULT_COST_SAMPLE_FREQ 99U
+#define DEFAULT_COST_STACK_BYTES 8192U
+#define DEFAULT_COST_RING_PAGES 64U
+#define COST_RAW_MAGIC 0x43524452U
+#define COST_RAW_VERSION 1U
+#define ARM64_USER_REGS_MASK ((1ULL << PERF_REG_ARM64_MAX) - 1ULL)
 
 #ifndef PERF_AUX_FLAG_COLLISION
 #define PERF_AUX_FLAG_COLLISION 0x8
@@ -44,6 +54,46 @@ struct read_format {
     uint64_t time_enabled;
     uint64_t time_running;
 };
+
+/** @brief 构造 epoll 中 sampler slot 的稳定 token。 */
+static uint64_t make_sampler_token(uint32_t slot_id)
+{
+    return (SAMPLER_TOKEN_KIND << 32) | slot_id;
+}
+
+/** @brief 构造 epoll 中 cost fd 的稳定 token。 */
+static uint64_t make_cost_token(uint32_t fd)
+{
+    return (COST_TOKEN_KIND << 32) | fd;
+}
+
+/** @brief perf_event_open syscall wrapper。 */
+static int perf_event_open_sys(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd,
+    unsigned long flags)
+{
+    return (int)syscall(SYS_perf_event_open, attr, pid, cpu, group_fd, flags);
+}
+
+/** @brief 从 perf ring 中按环形 offset 拷贝一段数据。 */
+static void perf_ring_copy(const uint8_t *data, size_t data_size, uint64_t offset, void *dst, size_t len)
+{
+    size_t begin = (size_t)(offset % data_size);
+    size_t first = std::min(len, data_size - begin);
+    memcpy(dst, data + begin, first);
+    if (first < len)
+        memcpy((uint8_t *)dst + first, data, len - first);
+}
+
+/** @brief 从 perf sample payload 中读取一个 POD 字段。 */
+template <typename T>
+static bool read_sample_field(const uint8_t *buf, size_t size, size_t& off, T& out)
+{
+    if (off + sizeof(T) > size)
+        return false;
+    memcpy(&out, buf + off, sizeof(T));
+    off += sizeof(T);
+    return true;
+}
 
 /** @brief 读取一个 perf fd 的 value/time_enabled/time_running。 */
 static read_format read_fd(int fd)
@@ -73,10 +123,36 @@ static bool is_arm_spe_address_packet(uint8_t header)
     return (header & SPE_PACKET_ADDRESS_MASK) == SPE_PACKET_ADDRESS_HEADER;
 }
 
+/** @brief 判断一个 SPE packet 是否是短格式 counter 包。 */
+static bool is_arm_spe_counter_packet(uint8_t header)
+{
+    return (header & SPE_PACKET_COUNTER_MASK) == SPE_PACKET_COUNTER_HEADER;
+}
+
+/** @brief 判断一个 SPE packet 是否是短格式 events 包。 */
+static bool is_arm_spe_events_packet(uint8_t header)
+{
+    return (header & SPE_PACKET_EVENTS_MASK) == SPE_PACKET_EVENTS_HEADER;
+}
+
 /** @brief 取出短格式地址包中的 index 字段。 */
 static uint8_t arm_spe_short_index(uint8_t header)
 {
     return header & SPE_PACKET_SHORT_INDEX_MASK;
+}
+
+/** @brief 根据 header 的 size 字段返回 payload 字节数。 */
+static int arm_spe_payload_size(uint8_t header)
+{
+    return 1 << ((header & SPE_PACKET_HEADER_PAYLOAD_SIZE_MASK) >> 4);
+}
+
+/** @brief 读取当前实现支持的最多 8 字节 little-endian payload。 */
+static uint64_t read_spe_payload(const char *packet, int payload_size)
+{
+    uint64_t payload = 0;
+    memcpy(&payload, packet + 1, payload_size);
+    return payload;
 }
 
 /** @brief 取出地址 payload 的低 56 位。 */
@@ -298,10 +374,33 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
     , _is_pin(is_pin)
     , _event_fd(-1)
     , _epoll_fd(-1)
+    , _callpath_cost_enabled(false)
+    , _cost_sample_freq(DEFAULT_COST_SAMPLE_FREQ)
+    , _cost_stack_bytes(DEFAULT_COST_STACK_BYTES)
+    , _cost_ring_pages(DEFAULT_COST_RING_PAGES)
+    , _cost_consumer_cpu(-1)
     , _hotspot_top_k(DEFAULT_HOTSPOT_TOP_K)
+    , _hotspot_min_samples(1)
+    , _hotspot_min_latency_samples(1)
     , _hotspot_unmapped_samples(0)
+    , _spe_time_packet_flush_count(0)
+    , _spe_end_packet_flush_count(0)
+    , _spe_empty_flush_count(0)
+    , _spe_unknown_packet_count(0)
 {
     const char *env_hotspot_top_k = getenv("RD_HOTSPOT_TOP_K");
+    const char *env_hotspot_min_samples = getenv("RD_HOTPC_MIN_SAMPLES");
+    const char *env_hotspot_min_latency_samples = getenv("RD_HOTPC_MIN_LATENCY_SAMPLES");
+    const char *env_callpath_cost = getenv("RD_CALLPATH_COST");
+
+    if (env_callpath_cost && *env_callpath_cost) {
+        char *end = nullptr;
+        long value = strtol(env_callpath_cost, &end, 10);
+
+        if (!end || *end != '\0' || (value != 0 && value != 1))
+            throw RdException("RD_CALLPATH_COST must be 0 or 1");
+        _callpath_cost_enabled = (value == 1);
+    }
 
     if (env_hotspot_top_k && *env_hotspot_top_k) {
         char *end = nullptr;
@@ -310,6 +409,24 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
         if (!end || *end != '\0' || value == 0)
             throw RdException("RD_HOTSPOT_TOP_K must be a positive integer");
         _hotspot_top_k = (size_t)value;
+    }
+
+    if (env_hotspot_min_samples && *env_hotspot_min_samples) {
+        char *end = nullptr;
+        unsigned long value = strtoul(env_hotspot_min_samples, &end, 10);
+
+        if (!end || *end != '\0' || value == 0)
+            throw RdException("RD_HOTPC_MIN_SAMPLES must be a positive integer");
+        _hotspot_min_samples = (size_t)value;
+    }
+
+    if (env_hotspot_min_latency_samples && *env_hotspot_min_latency_samples) {
+        char *end = nullptr;
+        unsigned long value = strtoul(env_hotspot_min_latency_samples, &end, 10);
+
+        if (!end || *end != '\0' || value == 0)
+            throw RdException("RD_HOTPC_MIN_LATENCY_SAMPLES must be a positive integer");
+        _hotspot_min_latency_samples = (size_t)value;
     }
 
     char fn[128];
@@ -325,7 +442,7 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
         throw RdException("clock_getres failure (CLOCK_MONOTONIC_RAW)");
     _clock_res = res.tv_nsec * 1000000000ULL;
 
-    if (_num_samplers > 0) {
+    if (_num_samplers > 0 || _callpath_cost_enabled) {
         _epoll_fd = epoll_create(1024);
         if (_epoll_fd < 0)
             throw RdException("epoll_create failed");
@@ -350,6 +467,9 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
         ep_event.data.u32 = EVENTFD_TOKEN;
         if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, _event_fd, &ep_event) < 0)
             throw RdException("epoll_ctl");
+
+        if (_callpath_cost_enabled && _num_cpus > 1)
+            _cost_consumer_cpu = _num_cpus - 1;
     }
 
     _prev_counters.assign(_num_counters + _num_samplers, 0);
@@ -380,13 +500,13 @@ bool Monitor::has_arm_spe_samples() const
 /** @brief 返回单条样本记录的字节数。 */
 size_t Monitor::sample_record_bytes() const
 {
-    return has_arm_spe_samples() ? sizeof(uint64_t) * 3 : sizeof(uint64_t) * 2;
+    return has_arm_spe_samples() ? sizeof(spe_instruction_sample) : sizeof(uint64_t) * 2;
 }
 
 /** @brief 返回当前样本记录的字段顺序描述。 */
 const char *Monitor::sample_record_fields() const
 {
-    return has_arm_spe_samples() ? "addr,time,pc" : "time,addr";
+    return has_arm_spe_samples() ? "pc,lat_total,lat_issue,lat_xlat,event_bits,flags" : "time,addr";
 }
 
 /** @brief 判断样本记录中是否显式携带 PC。 */
@@ -476,59 +596,243 @@ bool Monitor::is_main_binary_module(const module_map_entry& entry) const
     return !_main_binary_path.empty() && entry.path == _main_binary_path;
 }
 
-/** @brief 记录一次热点 PC 样本，并按“模块 + offset”归并。 */
-void Monitor::record_hotspot_sample(int tid, uint64_t pc)
+static bool spe_sample_has_event(const spe_instruction_sample& sample, int event_bit)
 {
-    if (!sample_pc_present() || tid <= 0 || pc == 0)
+    return (sample.flags & SPE_SAMPLE_FLAG_EVENTS_VALID) &&
+        (sample.event_bits & (1ULL << event_bit));
+}
+
+static uint64_t hotspot_latency_count(const hotspot_stats& stats)
+{
+    return stats.lat_exec_count ? stats.lat_exec_count : stats.lat_total_count;
+}
+
+static uint64_t hotspot_candidate_score(const hotspot_stats& stats)
+{
+    return stats.lat_exec_count ? stats.lat_exec_sum : stats.lat_total_sum;
+}
+
+static const char *hotspot_candidate_metric(const hotspot_stats& stats)
+{
+    return stats.lat_exec_count ? "lat_exec_sum" : "lat_total_sum";
+}
+
+static double hotspot_avg_mem_latency(const hotspot_stats& stats)
+{
+    if (stats.lat_exec_count)
+        return (double)stats.lat_exec_sum / (double)stats.lat_exec_count;
+    if (stats.lat_total_count)
+        return (double)stats.lat_total_sum / (double)stats.lat_total_count;
+    return 0.0;
+}
+
+static bool hotspot_dominates(const hotspot_summary& a, const hotspot_summary& b)
+{
+    bool sample_ge = a.sample_count >= b.sample_count;
+    bool latency_ge = a.avg_mem_latency >= b.avg_mem_latency;
+    bool sample_gt = a.sample_count > b.sample_count;
+    bool latency_gt = a.avg_mem_latency > b.avg_mem_latency;
+    return sample_ge && latency_ge && (sample_gt || latency_gt);
+}
+
+static bool hotspot_score_before(const hotspot_summary& a, const hotspot_summary& b)
+{
+    if (a.candidate_score != b.candidate_score)
+        return a.candidate_score > b.candidate_score;
+    if (a.sample_count != b.sample_count)
+        return a.sample_count > b.sample_count;
+    if (a.module_id != b.module_id)
+        return a.module_id < b.module_id;
+    return a.pc_offset < b.pc_offset;
+}
+
+/** @brief 记录一次热点 PC 样本，并按“模块 + offset”归并。 */
+void Monitor::record_hotspot_sample(int tid, const spe_instruction_sample& sample)
+{
+    if (!sample_pc_present() || tid <= 0 || sample.pc == 0 ||
+        !(sample.flags & SPE_SAMPLE_FLAG_PC_VALID))
         return;
 
-    const module_map_entry *entry = find_module_map(pc);
+    const module_map_entry *entry = find_module_map(sample.pc);
     if (!entry) {
         _hotspot_unmapped_samples += 1;
         return;
     }
     if (!is_main_binary_module(*entry))
         return;
-
     hotspot_key key = {};
     key.module_id = entry->module_id;
-    key.pc_offset = pc - entry->vm_start + entry->file_offset;
-    _thread_hotspots[tid][key] += 1;
+    key.pc_offset = sample.pc - entry->vm_start + entry->file_offset;
+
+    hotspot_stats& stats = _thread_hotspots[tid][key];
+    stats.sample_count += 1;
+    if (sample.flags & SPE_SAMPLE_FLAG_LAT_TOTAL_VALID) {
+        stats.lat_total_sum += sample.lat_total;
+        stats.lat_total_count += 1;
+    }
+    if (sample.flags & SPE_SAMPLE_FLAG_LAT_ISSUE_VALID) {
+        stats.lat_issue_sum += sample.lat_issue;
+        stats.lat_issue_count += 1;
+    }
+    if (sample.flags & SPE_SAMPLE_FLAG_LAT_XLAT_VALID) {
+        stats.lat_xlat_sum += sample.lat_xlat;
+        stats.lat_xlat_count += 1;
+    }
+    if (sample.flags & SPE_SAMPLE_FLAG_LAT_EXEC_VALID) {
+        uint64_t issue_and_xlat = sample.lat_issue + sample.lat_xlat;
+        stats.lat_exec_sum += sample.lat_total - issue_and_xlat;
+        stats.lat_exec_count += 1;
+    }
+    if (spe_sample_has_event(sample, SPE_EVENT_L1D_REFILL))
+        stats.l1d_refill_count += 1;
+    if (spe_sample_has_event(sample, SPE_EVENT_LLC_MISS))
+        stats.llc_miss_count += 1;
+    if (spe_sample_has_event(sample, SPE_EVENT_TLB_WALK))
+        stats.tlb_walk_count += 1;
+    if (spe_sample_has_event(sample, SPE_EVENT_REMOTE_ACCESS))
+        stats.remote_access_count += 1;
+}
+
+/** @brief 清空 slot 中未完成的 SPE sampled instruction 状态。 */
+void Monitor::reset_pending_spe_sample(sampler_slot& slot) const
+{
+    slot.pending_pc = 0;
+    slot.pending_lat_total = 0;
+    slot.pending_lat_issue = 0;
+    slot.pending_lat_xlat = 0;
+    slot.pending_event_bits = 0;
+    slot.pending_flags = 0;
+}
+
+/** @brief 将 pending SPE 状态写出为一条 48 字节指令级样本。 */
+bool Monitor::flush_pending_spe_sample_locked(sampler_slot& slot, BinaryWriter& writer, size_t& num_samples,
+    bool from_end_packet)
+{
+    if (!(slot.pending_flags & SPE_SAMPLE_FLAG_PC_VALID)) {
+        reset_pending_spe_sample(slot);
+        _spe_empty_flush_count += 1;
+        return false;
+    }
+
+    spe_instruction_sample sample = {};
+    sample.pc = slot.pending_pc;
+    sample.lat_total = slot.pending_lat_total;
+    sample.lat_issue = slot.pending_lat_issue;
+    sample.lat_xlat = slot.pending_lat_xlat;
+    sample.event_bits = slot.pending_event_bits;
+    sample.flags = slot.pending_flags;
+
+    const uint64_t latency_flags =
+        SPE_SAMPLE_FLAG_LAT_TOTAL_VALID |
+        SPE_SAMPLE_FLAG_LAT_ISSUE_VALID |
+        SPE_SAMPLE_FLAG_LAT_XLAT_VALID;
+    if ((sample.flags & latency_flags) == latency_flags &&
+        sample.lat_total >= sample.lat_issue + sample.lat_xlat)
+        sample.flags |= SPE_SAMPLE_FLAG_LAT_EXEC_VALID;
+
+    writer.write((char *)&sample, sizeof(sample));
+    _written_sample_bytes += sizeof(sample);
+    record_hotspot_sample(slot.tid, sample);
+    num_samples++;
+    if (from_end_packet)
+        _spe_end_packet_flush_count += 1;
+    else
+        _spe_time_packet_flush_count += 1;
+    reset_pending_spe_sample(slot);
+    return true;
 }
 
 /** @brief 生成一个线程的热点摘要列表，并按热度排序。 */
 std::vector<hotspot_summary> Monitor::collect_hotspots_for_thread(int tid) const
 {
-    std::vector<hotspot_summary> summaries;
+    std::vector<hotspot_summary> all_summaries;
     auto it = _thread_hotspots.find(tid);
     if (it == _thread_hotspots.end())
-        return summaries;
+        return all_summaries;
 
-    summaries.reserve(it->second.size());
+    all_summaries.reserve(it->second.size());
     for (const auto& kv : it->second) {
+        const hotspot_stats& stats = kv.second;
         hotspot_summary summary = {};
         summary.tid = tid;
         summary.module_id = kv.first.module_id;
         summary.pc_offset = kv.first.pc_offset;
-        summary.sample_count = kv.second;
+        summary.sample_count = stats.sample_count;
+        summary.candidate_score = hotspot_candidate_score(stats);
+        summary.candidate_metric = hotspot_candidate_metric(stats);
+        summary.avg_mem_latency = hotspot_avg_mem_latency(stats);
+        summary.lat_total_sum = stats.lat_total_sum;
+        summary.lat_issue_sum = stats.lat_issue_sum;
+        summary.lat_xlat_sum = stats.lat_xlat_sum;
+        summary.lat_exec_sum = stats.lat_exec_sum;
+        summary.l1d_refill_count = stats.l1d_refill_count;
+        summary.llc_miss_count = stats.llc_miss_count;
+        summary.tlb_walk_count = stats.tlb_walk_count;
+        summary.remote_access_count = stats.remote_access_count;
         if (summary.module_id < _module_maps.size())
             summary.path = _module_maps[summary.module_id].path;
         else
             summary.path = "[unknown_module]";
+        all_summaries.push_back(summary);
+    }
+
+    std::vector<hotspot_summary> filtered;
+    std::vector<hotspot_summary> fallback;
+    for (auto summary : all_summaries) {
+        auto stats_it = it->second.find({summary.module_id, summary.pc_offset});
+        uint64_t latency_count = 0;
+        if (stats_it != it->second.end())
+            latency_count = hotspot_latency_count(stats_it->second);
+
+        if (summary.sample_count >= _hotspot_min_samples &&
+            latency_count >= _hotspot_min_latency_samples)
+            filtered.push_back(summary);
+        else
+            fallback.push_back(summary);
+    }
+
+    std::vector<hotspot_summary> front;
+    std::vector<hotspot_summary> non_front;
+    for (size_t i = 0; i < filtered.size(); i++) {
+        bool dominated = false;
+        for (size_t j = 0; j < filtered.size(); j++) {
+            if (i == j)
+                continue;
+            if (hotspot_dominates(filtered[j], filtered[i])) {
+                dominated = true;
+                break;
+            }
+        }
+        filtered[i].pareto_front = dominated ? 0 : 1;
+        if (dominated)
+            non_front.push_back(filtered[i]);
+        else
+            front.push_back(filtered[i]);
+    }
+
+    std::sort(front.begin(), front.end(), hotspot_score_before);
+    std::sort(non_front.begin(), non_front.end(), hotspot_score_before);
+    std::sort(fallback.begin(), fallback.end(), hotspot_score_before);
+
+    std::vector<hotspot_summary> summaries;
+    summaries.reserve(std::min(_hotspot_top_k, all_summaries.size()));
+    for (const auto& summary : front) {
+        if (summaries.size() >= _hotspot_top_k)
+            break;
+        summaries.push_back(summary);
+    }
+    for (const auto& summary : non_front) {
+        if (summaries.size() >= _hotspot_top_k)
+            break;
+        summaries.push_back(summary);
+    }
+    for (auto summary : fallback) {
+        if (summaries.size() >= _hotspot_top_k)
+            break;
+        summary.pareto_front = 0;
         summaries.push_back(summary);
     }
 
-    std::sort(summaries.begin(), summaries.end(),
-        [](const hotspot_summary& a, const hotspot_summary& b) {
-            if (a.sample_count != b.sample_count)
-                return a.sample_count > b.sample_count;
-            if (a.module_id != b.module_id)
-                return a.module_id < b.module_id;
-            return a.pc_offset < b.pc_offset;
-        });
-
-    if (summaries.size() > _hotspot_top_k)
-        summaries.resize(_hotspot_top_k);
     return summaries;
 }
 
@@ -554,7 +858,8 @@ void Monitor::write_hotspot_manifest() const
     out << "hotspot_scope=main_binary_only" << std::endl;
     out << "hotspot_main_binary=" << _main_binary_path << std::endl;
     out << "hotspot_kind_hint=arm_spe_loadstore" << std::endl;
-    out << "hotspot_fields=tid,rank,sample_count,module_id,pc_offset,path" << std::endl;
+    out << "hotspot_selection_policy=pareto_sample_count_avg_mem_latency" << std::endl;
+    out << "hotspot_fields=tid,rank,sample_count,module_id,pc_offset,path,pareto_front,candidate_score,candidate_metric,avg_mem_latency,lat_total_sum,lat_issue_sum,lat_xlat_sum,lat_exec_sum,l1d_refill_count,llc_miss_count,tlb_walk_count,remote_access_count" << std::endl;
     out << "hotspot_count=" << hotspot_count << std::endl;
     out << "hotspot_unmapped_pc_samples=" << _hotspot_unmapped_samples << std::endl;
 
@@ -568,7 +873,19 @@ void Monitor::write_hotspot_manifest() const
                 << hotspot.sample_count << "\t"
                 << hotspot.module_id << "\t"
                 << "0x" << std::hex << hotspot.pc_offset << std::dec << "\t"
-                << hotspot.path << std::endl;
+                << hotspot.path << "\t"
+                << hotspot.pareto_front << "\t"
+                << hotspot.candidate_score << "\t"
+                << hotspot.candidate_metric << "\t"
+                << hotspot.avg_mem_latency << "\t"
+                << hotspot.lat_total_sum << "\t"
+                << hotspot.lat_issue_sum << "\t"
+                << hotspot.lat_xlat_sum << "\t"
+                << hotspot.lat_exec_sum << "\t"
+                << hotspot.l1d_refill_count << "\t"
+                << hotspot.llc_miss_count << "\t"
+                << hotspot.tlb_walk_count << "\t"
+                << hotspot.remote_access_count << std::endl;
         }
     }
 }
@@ -595,15 +912,67 @@ void Monitor::write_info(std::ofstream& info)
     info << "bufsize_aux=" << _auxbufsize << std::endl;
     info << "clock_res=" << 1.0 / _clock_res << std::endl;
     info << "l1_cache_line_size=" << sysconf(_SC_LEVEL1_DCACHE_LINESIZE) << std::endl;
+    info << "main_binary=" << _main_binary_path << std::endl;
+
+    info << "callpath_cost_present=" << (_callpath_cost_enabled ? 1 : 0) << std::endl;
+    if (_callpath_cost_enabled) {
+        uint64_t total_cost_samples = 0;
+        uint64_t total_cost_lost = 0;
+        uint64_t total_cost_invalid = 0;
+
+        info << "callpath_cost_stage=first_stage" << std::endl;
+        info << "callpath_cost_event=cpu-clock" << std::endl;
+        info << "callpath_cost_wakeup=epoll" << std::endl;
+        info << "callpath_cost_attach_scope=monitored_threads" << std::endl;
+        info << "callpath_cost_exclude_kernel=1" << std::endl;
+        info << "callpath_cost_sample_freq=" << _cost_sample_freq << std::endl;
+        info << "callpath_cost_stack_bytes=" << _cost_stack_bytes << std::endl;
+        info << "callpath_cost_ring_pages=" << _cost_ring_pages << std::endl;
+        info << "callpath_cost_consumer_cpu=" << _cost_consumer_cpu << std::endl;
+        info << "callpath_cost_raw_record_bytes=" << sizeof(callpath_cost_raw_record) << std::endl;
+
+        for (int tid : _tids) {
+            auto it = _threads.find(tid);
+            if (it == _threads.end())
+                continue;
+            const thread_state& state = it->second;
+            total_cost_samples += state.cost_samples;
+            total_cost_lost += state.cost_lost_samples;
+            total_cost_invalid += state.cost_invalid_samples;
+            info << "cost_thread=" << state.tid << "\t"
+                 << read_thread_last_cpu_stat(state.tid) << "\t"
+                 << state.cost_samples << "\t"
+                 << state.cost_lost_samples << "\t"
+                 << state.cost_invalid_samples << "\t"
+                 << (_nameprefix + ".t" + std::to_string(state.tid) + ".cost.raw.bin")
+                 << std::endl;
+        }
+        info << "callpath_cost_samples=" << total_cost_samples << std::endl;
+        info << "callpath_cost_lost_samples=" << total_cost_lost << std::endl;
+        info << "callpath_cost_invalid_samples=" << total_cost_invalid << std::endl;
+    }
 
     if (_num_samplers > 0) {
         info << "sample_record_bytes=" << sample_record_bytes() << std::endl;
         info << "sample_record_fields=" << sample_record_fields() << std::endl;
         info << "sample_pc_present=" << (sample_pc_present() ? 1 : 0) << std::endl;
+        if (has_arm_spe_samples()) {
+            info << "sample_data_va_present=0" << std::endl;
+            info << "sample_time_present=0" << std::endl;
+            info << "spe_time_packet_used_as_record_end=1" << std::endl;
+            info << "spe_end_packet_used_as_record_end=1" << std::endl;
+            info << "spe_sample_flags=pc_valid,lat_total_valid,lat_issue_valid,lat_xlat_valid,events_valid,lat_exec_valid" << std::endl;
+        }
     }
 
     if (sample_pc_present()) {
         info << "pc_identity=raw_va" << std::endl;
+        info << "spe_latency_present=1" << std::endl;
+        info << "spe_event_packet_present=1" << std::endl;
+        info << "spe_time_packet_flush_count=" << _spe_time_packet_flush_count << std::endl;
+        info << "spe_end_packet_flush_count=" << _spe_end_packet_flush_count << std::endl;
+        info << "spe_empty_flush_count=" << _spe_empty_flush_count << std::endl;
+        info << "spe_unknown_packet_count=" << _spe_unknown_packet_count << std::endl;
         info << "module_map_fields=module_id,path,vm_start,vm_end,file_offset" << std::endl;
         info << "module_map_count=" << _module_maps.size() << std::endl;
         for (const auto& entry : _module_maps) {
@@ -623,21 +992,25 @@ void Monitor::write_info(std::ofstream& info)
             if (!tid_and_hotspots.second.empty())
                 hotspot_thread_count += 1;
             for (const auto& kv : tid_and_hotspots.second)
-                hotspot_total_samples += kv.second;
+                hotspot_total_samples += kv.second.sample_count;
         }
         for (int tid : _tids)
             hotspot_count += collect_hotspots_for_thread(tid).size();
 
         info << "hotspot_top_k=" << _hotspot_top_k << std::endl;
+        info << "hotspot_min_samples=" << _hotspot_min_samples << std::endl;
+        info << "hotspot_min_latency_samples=" << _hotspot_min_latency_samples << std::endl;
         info << "hotspot_identity=module_offset" << std::endl;
         info << "hotspot_scope=main_binary_only" << std::endl;
         info << "hotspot_main_binary=" << _main_binary_path << std::endl;
         info << "hotspot_kind_hint=arm_spe_loadstore" << std::endl;
+        info << "hotspot_selection_policy=pareto_sample_count_avg_mem_latency" << std::endl;
+        info << "hotspot_score_policy=lat_exec_sum_with_lat_total_sum_fallback" << std::endl;
         info << "hotspot_thread_count=" << hotspot_thread_count << std::endl;
         info << "hotspot_total_samples=" << hotspot_total_samples << std::endl;
         info << "hotspot_unmapped_pc_samples=" << _hotspot_unmapped_samples << std::endl;
         info << "hotspot_manifest=" << _nameprefix << ".hotpc" << std::endl;
-        info << "hotspot_fields=tid,rank,sample_count,module_id,pc_offset,path" << std::endl;
+        info << "hotspot_fields=tid,rank,sample_count,module_id,pc_offset,path,pareto_front,candidate_score,candidate_metric,avg_mem_latency,lat_total_sum,lat_issue_sum,lat_xlat_sum,lat_exec_sum,l1d_refill_count,llc_miss_count,tlb_walk_count,remote_access_count" << std::endl;
         info << "hotspot_count=" << hotspot_count << std::endl;
         for (int tid : _tids) {
             std::vector<hotspot_summary> hotspots = collect_hotspots_for_thread(tid);
@@ -649,7 +1022,19 @@ void Monitor::write_info(std::ofstream& info)
                      << hotspot.sample_count << "\t"
                      << hotspot.module_id << "\t"
                      << "0x" << std::hex << hotspot.pc_offset << std::dec << "\t"
-                     << hotspot.path << std::endl;
+                     << hotspot.path << "\t"
+                     << hotspot.pareto_front << "\t"
+                     << hotspot.candidate_score << "\t"
+                     << hotspot.candidate_metric << "\t"
+                     << hotspot.avg_mem_latency << "\t"
+                     << hotspot.lat_total_sum << "\t"
+                     << hotspot.lat_issue_sum << "\t"
+                     << hotspot.lat_xlat_sum << "\t"
+                     << hotspot.lat_exec_sum << "\t"
+                     << hotspot.l1d_refill_count << "\t"
+                     << hotspot.llc_miss_count << "\t"
+                     << hotspot.tlb_walk_count << "\t"
+                     << hotspot.remote_access_count << std::endl;
             }
         }
     }
@@ -789,7 +1174,7 @@ Monitor::~Monitor()
         close(_event_fd);
     if (_epoll_fd != -1)
         close(_epoll_fd);
-    if (_num_samplers > 0)
+    if (_epoll_fd != -1)
         sem_destroy(&_sampler_drain);
 
     std::cerr << "Monitor::~Monitor done" << std::endl;
@@ -813,6 +1198,13 @@ thread_state& Monitor::register_thread_locked(int tid)
         _tids.push_back(tid);
     if (state.active)
         return state;
+
+    state.cost_fd = -1;
+    state.cost_output_fd = -1;
+    state.cost_mmap_base = nullptr;
+    state.cost_mmap_len = 0;
+    state.cost_data_size = 0;
+    state.cost_epoll_registered = false;
 
     try {
         open_thread_locked(state);
@@ -848,6 +1240,19 @@ void Monitor::open_thread_locked(thread_state& state)
     } else {
         state.counter_fds.clear();
     }
+
+    state.cost_fd = -1;
+    state.cost_output_fd = -1;
+    state.cost_mmap_base = nullptr;
+    state.cost_mmap_len = 0;
+    state.cost_data_size = 0;
+    state.cost_epoll_registered = false;
+    state.cost_samples = 0;
+    state.cost_lost_samples = 0;
+    state.cost_invalid_samples = 0;
+
+    if (_callpath_cost_enabled)
+        setup_cost_sampler_locked(state);
 
     if (_num_samplers == 0)
         return;
@@ -887,10 +1292,7 @@ void Monitor::open_thread_locked(thread_state& state)
             slot.sampler_index = sampler;
             slot.fd = sampler_fds[sampler];
             sampler_fds[sampler] = -1;
-            slot.pending_time = 0;
-            slot.pending_addr = 0;
-            slot.pending_pc = 0;
-            slot.pending_mask = 0;
+            reset_pending_spe_sample(slot);
             slot.ringbuf_bytes = (1 + ring_buffer_pages) * PAGE_SIZE;
             slot.auxbuf_bytes = 0;
             slot.ringbuf = mmap(0, slot.ringbuf_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, slot.fd, 0);
@@ -923,7 +1325,7 @@ void Monitor::open_thread_locked(thread_state& state)
             if (_epoll_fd != -1) {
                 epoll_event ep_event = {};
                 ep_event.events = EPOLLIN;
-                ep_event.data.u32 = (uint32_t)slot_ptr->slot_id + 1;
+                ep_event.data.u64 = make_sampler_token((uint32_t)slot_ptr->slot_id);
                 if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, slot_ptr->fd, &ep_event) < 0)
                     throw RdException("epoll_ctl");
             }
@@ -948,6 +1350,8 @@ void Monitor::enable_thread_locked(thread_state& state)
         if (slot.fd >= 0)
             ioctl(slot.fd, PERF_EVENT_IOC_ENABLE, 0);
     }
+    if (state.cost_fd >= 0)
+        ioctl(state.cost_fd, PERF_EVENT_IOC_ENABLE, 0);
 }
 
 /** @brief disable 一个线程上的全部 perf 事件。 */
@@ -961,10 +1365,14 @@ void Monitor::disable_thread_locked(thread_state& state)
         if (slot.fd >= 0)
             ioctl(slot.fd, PERF_EVENT_IOC_DISABLE, 0);
     }
+    if (state.cost_fd >= 0) {
+        ioctl(state.cost_fd, PERF_EVENT_IOC_DISABLE, 0);
+        consume_cost_samples_locked(state);
+    }
 }
 
 /** @brief 把即将退役线程的累计 perf 计数合并入全局退役计数。 */
-void Monitor::accumulate_retired_counts_locked(const thread_state& state)
+void Monitor::accumulate_retired_counts_locked(thread_state& state)
 {
     for (int counter = 0; counter < _num_counters; counter++) {
         if (counter >= (int)state.counter_fds.size() || state.counter_fds[counter] < 0)
@@ -984,6 +1392,9 @@ void Monitor::accumulate_retired_counts_locked(const thread_state& state)
         _retired_time_enabled[index] += count.time_enabled;
         _retired_time_running[index] += count.time_running;
     }
+
+    if (state.cost_fd >= 0)
+        consume_cost_samples_locked(state);
 }
 
 /** @brief 关闭并回收一个线程上的所有 perf fd 与映射。 */
@@ -1010,6 +1421,7 @@ void Monitor::close_thread_locked(thread_state& state)
             close(fd);
     }
     state.counter_fds.clear();
+    teardown_cost_sampler_locked(state);
     state.active = false;
 }
 
@@ -1028,6 +1440,202 @@ void Monitor::unregister_thread_locked(int tid)
 
     accumulate_retired_counts_locked(*state);
     close_thread_locked(*state);
+}
+
+/** @brief 为一个线程创建 disabled 状态的 cpu-clock 调用栈 cost sampler。 */
+void Monitor::setup_cost_sampler_locked(thread_state& state)
+{
+    if (!_callpath_cost_enabled)
+        return;
+
+    struct perf_event_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.type = PERF_TYPE_SOFTWARE;
+    attr.size = sizeof(attr);
+    attr.config = PERF_COUNT_SW_CPU_CLOCK;
+    attr.disabled = 1;
+    attr.freq = 1;
+    attr.sample_freq = _cost_sample_freq;
+    attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME |
+        PERF_SAMPLE_CPU | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
+    attr.sample_regs_user = ARM64_USER_REGS_MASK;
+    attr.sample_stack_user = _cost_stack_bytes;
+    attr.exclude_kernel = 1;
+    attr.exclude_hv = 1;
+    attr.inherit = 0;
+    attr.wakeup_events = 8;
+
+    int fd = perf_event_open_sys(&attr, state.tid, -1, -1, PERF_FLAG_FD_CLOEXEC);
+    if (fd < 0)
+        throw RdException(std::string("perf_event_open cpu-clock cost sampler failed: ") + strerror(errno));
+
+    size_t mmap_len = (size_t)(_cost_ring_pages + 1) * (size_t)PAGE_SIZE;
+    void *base = mmap(nullptr, mmap_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        throw RdException(std::string("mmap cpu-clock cost ring failed: ") + strerror(errno));
+    }
+
+    std::string raw_path = _nameprefix + ".t" + std::to_string(state.tid) + ".cost.raw.bin";
+    int out_fd = open(raw_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
+    if (out_fd < 0) {
+        munmap(base, mmap_len);
+        close(fd);
+        throw RdException("cannot open " + raw_path);
+    }
+
+    state.cost_fd = fd;
+    state.cost_output_fd = out_fd;
+    state.cost_mmap_base = base;
+    state.cost_mmap_len = mmap_len;
+    state.cost_data_size = (size_t)_cost_ring_pages * (size_t)PAGE_SIZE;
+    state.cost_samples = 0;
+    state.cost_lost_samples = 0;
+    state.cost_invalid_samples = 0;
+    register_cost_fd_epoll_locked(state);
+}
+
+/** @brief 将线程 cost fd 加入 Monitor 后台 epoll。 */
+void Monitor::register_cost_fd_epoll_locked(thread_state& state)
+{
+    if (!_callpath_cost_enabled || _epoll_fd < 0 || state.cost_fd < 0 || state.cost_epoll_registered)
+        return;
+
+    epoll_event ev = {};
+    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
+    ev.data.u64 = make_cost_token((uint32_t)state.cost_fd);
+    if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, state.cost_fd, &ev) < 0)
+        throw RdException(std::string("epoll_ctl ADD first-stage cost fd failed: ") + strerror(errno));
+    _cost_fd_to_tid[state.cost_fd] = state.tid;
+    state.cost_epoll_registered = true;
+}
+
+/** @brief 将线程 cost fd 从 Monitor 后台 epoll 删除。 */
+void Monitor::unregister_cost_fd_epoll_locked(thread_state& state)
+{
+    if (!_callpath_cost_enabled || _epoll_fd < 0 || state.cost_fd < 0 || !state.cost_epoll_registered)
+        return;
+
+    if (epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, state.cost_fd, nullptr) < 0 && errno != EBADF && errno != ENOENT)
+        throw RdException(std::string("epoll_ctl DEL first-stage cost fd failed: ") + strerror(errno));
+    _cost_fd_to_tid.erase(state.cost_fd);
+    state.cost_epoll_registered = false;
+}
+
+/** @brief drain 并解析一个线程的 cpu-clock perf ring。 */
+void Monitor::consume_cost_samples_locked(thread_state& state)
+{
+    if (!_callpath_cost_enabled || state.cost_fd < 0 || !state.cost_mmap_base)
+        return;
+
+    perf_event_mmap_page *meta = (perf_event_mmap_page *)state.cost_mmap_base;
+    uint8_t *data = (uint8_t *)state.cost_mmap_base + PAGE_SIZE;
+    uint64_t head = meta->data_head;
+    __sync_synchronize();
+    uint64_t tail = meta->data_tail;
+
+    while (tail < head) {
+        perf_event_header hdr;
+        perf_ring_copy(data, state.cost_data_size, tail, &hdr, sizeof(hdr));
+        if (hdr.size < sizeof(hdr) || tail + hdr.size > head) {
+            state.cost_invalid_samples++;
+            tail = head;
+            break;
+        }
+
+        std::vector<uint8_t> rec(hdr.size);
+        perf_ring_copy(data, state.cost_data_size, tail, rec.data(), rec.size());
+
+        if (hdr.type == PERF_RECORD_LOST) {
+            if (hdr.size >= sizeof(hdr) + 2 * sizeof(uint64_t)) {
+                uint64_t lost = 0;
+                memcpy(&lost, rec.data() + sizeof(hdr) + sizeof(uint64_t), sizeof(lost));
+                state.cost_lost_samples += lost;
+            } else {
+                state.cost_invalid_samples++;
+            }
+        } else if (hdr.type == PERF_RECORD_SAMPLE) {
+            size_t off = sizeof(hdr);
+            callpath_cost_raw_record out = {};
+            out.magic = COST_RAW_MAGIC;
+            out.version = COST_RAW_VERSION;
+            out.header_size = sizeof(out);
+            out.regs_mask = ARM64_USER_REGS_MASK;
+
+            uint32_t pid = 0;
+            uint32_t reserved = 0;
+            uint64_t abi = 0;
+            uint64_t stack_size = 0;
+            uint64_t dyn_stack_size = 0;
+            bool ok = true;
+
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.ip);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, pid);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.tid);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.time);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.cpu);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, reserved);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, abi);
+            for (uint32_t i = 0; ok && i < PERF_REG_ARM64_MAX; i++)
+                ok = ok && read_sample_field(rec.data(), rec.size(), off, out.regs[i]);
+            ok = ok && read_sample_field(rec.data(), rec.size(), off, stack_size);
+            if (ok) {
+                uint64_t copy_size = std::min<uint64_t>(stack_size, sizeof(out.stack));
+                if (off + stack_size + sizeof(uint64_t) <= rec.size()) {
+                    memcpy(out.stack, rec.data() + off, copy_size);
+                    out.stack_size = (uint32_t)copy_size;
+                    off += (size_t)stack_size;
+                    ok = ok && read_sample_field(rec.data(), rec.size(), off, dyn_stack_size);
+                    out.dyn_stack_size = (uint32_t)std::min<uint64_t>(dyn_stack_size, UINT32_MAX);
+                } else {
+                    ok = false;
+                }
+            }
+
+            if (ok && out.tid == (uint32_t)state.tid) {
+                ssize_t wrote = write(state.cost_output_fd, &out, sizeof(out));
+                if (wrote == (ssize_t)sizeof(out))
+                    state.cost_samples++;
+                else
+                    state.cost_invalid_samples++;
+            } else {
+                state.cost_invalid_samples++;
+            }
+            (void)pid;
+            (void)reserved;
+            (void)abi;
+        }
+
+        tail += hdr.size;
+    }
+
+    meta->data_tail = tail;
+    __sync_synchronize();
+}
+
+/** @brief 回收一个线程的第一阶段 cost sampler。 */
+void Monitor::teardown_cost_sampler_locked(thread_state& state)
+{
+    if (!_callpath_cost_enabled)
+        return;
+
+    if (state.cost_fd >= 0)
+        ioctl(state.cost_fd, PERF_EVENT_IOC_DISABLE, 0);
+    unregister_cost_fd_epoll_locked(state);
+    consume_cost_samples_locked(state);
+    if (state.cost_mmap_base && state.cost_mmap_base != MAP_FAILED)
+        munmap(state.cost_mmap_base, state.cost_mmap_len);
+    if (state.cost_fd >= 0)
+        close(state.cost_fd);
+    if (state.cost_output_fd >= 0)
+        close(state.cost_output_fd);
+
+    state.cost_fd = -1;
+    state.cost_output_fd = -1;
+    state.cost_mmap_base = nullptr;
+    state.cost_mmap_len = 0;
+    state.cost_data_size = 0;
+    state.cost_epoll_registered = false;
 }
 
 /** @brief 注册当前线程，并在需要时立即 enable。 */
@@ -1062,6 +1670,14 @@ void Monitor::unregister_current_thread()
 void Monitor::run_sampler_thread()
 {
     int64_t tid = gettid();
+    if (_callpath_cost_enabled && _cost_consumer_cpu >= 0) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(_cost_consumer_cpu, &set);
+        if (sched_setaffinity((pid_t)tid, sizeof(set), &set) < 0)
+            std::cerr << "warning: failed to pin first-stage cost consumer to CPU "
+                      << _cost_consumer_cpu << ": " << strerror(errno) << std::endl;
+    }
     if (write(_event_fd, &tid, sizeof(tid)) != (ssize_t)sizeof(tid))
         throw RdException("eventfd write failed");
 
@@ -1079,13 +1695,18 @@ void Monitor::run_sampler_thread()
             }
 
             for (int i = 0; i < n; i++) {
-                uint32_t token = events[i].data.u32;
+                uint64_t token = events[i].data.u64;
                 if (token == EVENTFD_TOKEN) {
                     if (sizeof(efd_cmd) != read(_event_fd, &efd_cmd, sizeof(efd_cmd)))
                         throw RdException("eventfd read");
                     goto drain;
                 }
-                process_samples((int)token - 1);
+                uint32_t kind = (uint32_t)(token >> 32);
+                uint32_t value = (uint32_t)(token & 0xffffffffU);
+                if (kind == SAMPLER_TOKEN_KIND)
+                    process_samples((int)value);
+                else if (kind == COST_TOKEN_KIND)
+                    process_cost_samples((int)value);
             }
         }
 
@@ -1098,6 +1719,7 @@ drain:
                     continue;
                 for (auto& slot : kv.second.samplers)
                     extra_samples += process_samples_locked(slot);
+                consume_cost_samples_locked(kv.second);
             }
         }
 
@@ -1120,12 +1742,25 @@ size_t Monitor::process_samples(int slot_id)
     return process_samples_locked(*it->second);
 }
 
+/** @brief 通过 cost fd 路由到对应线程并 drain cpu-clock ring。 */
+void Monitor::process_cost_samples(int fd)
+{
+    std::lock_guard<std::mutex> lock(_state_mutex);
+    auto it = _cost_fd_to_tid.find(fd);
+    if (it == _cost_fd_to_tid.end())
+        return;
+    thread_state *state = find_thread_locked(it->second);
+    if (!state || !state->active)
+        return;
+    consume_cost_samples_locked(*state);
+}
+
 /**
  * @brief drain 一个 sampler slot 上的 ring/AUX 数据。
  *
  * 普通 `PERF_RECORD_SAMPLE` 直接写出 `time,addr`；
- * ARM SPE `PERF_RECORD_AUX` 则逐 packet 解码，并在 `time + data VA + pc`
- * 三元组齐备时写出 `addr,time,pc`。
+ * ARM SPE `PERF_RECORD_AUX` 则逐 packet 解码，并在 time/end packet 处
+ * 写出当前 sampled instruction 的 `pc + latency + event_bits + flags`。
  */
 size_t Monitor::process_samples_locked(sampler_slot& slot)
 {
@@ -1222,45 +1857,58 @@ size_t Monitor::process_samples_locked(sampler_slot& slot)
                     uint8_t spe_header = *(uint8_t *)spe_packet;
                     int spe_packet_payload_size = 0;
                     int spe_packet_header_size = 1;
-                    bool handled_short_address = false;
+                    bool handled_packet = false;
 
                     if (is_arm_spe_address_packet(spe_header)) {
                         int addr_index = arm_spe_short_index(spe_header);
-                        uint64_t raw_addr = *(uint64_t *)(spe_packet + 1);
+                        uint64_t raw_addr = read_spe_payload(spe_packet, 8);
                         uint64_t decoded_addr = decode_arm_spe_address_payload(addr_index, raw_addr);
 
-                        if (addr_index == SPE_ADDR_PKT_HDR_INDEX_DATA_VIRT) {
-                            slot.pending_addr = decoded_addr;
-                            slot.pending_mask |= 0x2;
-                        } else if (addr_index == SPE_ADDR_PKT_HDR_INDEX_INS) {
+                        if (addr_index == SPE_ADDR_PKT_HDR_INDEX_INS) {
                             slot.pending_pc = decoded_addr;
-                            slot.pending_mask |= 0x4;
+                            slot.pending_flags |= SPE_SAMPLE_FLAG_PC_VALID;
                         }
 
                         spe_packet_payload_size = 8;
-                        handled_short_address = true;
+                        handled_packet = true;
+                    } else if (is_arm_spe_counter_packet(spe_header)) {
+                        int counter_index = arm_spe_short_index(spe_header);
+                        spe_packet_payload_size = arm_spe_payload_size(spe_header);
+                        uint64_t value = read_spe_payload(spe_packet, spe_packet_payload_size);
+
+                        if (counter_index == SPE_CNT_PKT_HDR_INDEX_TOTAL_LAT) {
+                            slot.pending_lat_total = value;
+                            slot.pending_flags |= SPE_SAMPLE_FLAG_LAT_TOTAL_VALID;
+                        } else if (counter_index == SPE_CNT_PKT_HDR_INDEX_ISSUE_LAT) {
+                            slot.pending_lat_issue = value;
+                            slot.pending_flags |= SPE_SAMPLE_FLAG_LAT_ISSUE_VALID;
+                        } else if (counter_index == SPE_CNT_PKT_HDR_INDEX_TRANS_LAT) {
+                            slot.pending_lat_xlat = value;
+                            slot.pending_flags |= SPE_SAMPLE_FLAG_LAT_XLAT_VALID;
+                        }
+                        handled_packet = true;
+                    } else if (is_arm_spe_events_packet(spe_header)) {
+                        spe_packet_payload_size = arm_spe_payload_size(spe_header);
+                        slot.pending_event_bits = read_spe_payload(spe_packet, spe_packet_payload_size);
+                        slot.pending_flags |= SPE_SAMPLE_FLAG_EVENTS_VALID;
+                        handled_packet = true;
                     }
 
-                    if (!handled_short_address) {
+                    if (!handled_packet) {
                         switch (spe_header) {
                         case SPE_PACKET_PADDING_HEADER:
+                            spe_packet_payload_size = 0;
+                            break;
                         case SPE_PACKET_END_HEADER:
+                            flush_pending_spe_sample_locked(slot, writer, num_samples, true);
                             spe_packet_payload_size = 0;
                             break;
                         case SPE_PACKET_TS_HEADER:
-                        {
-                            uint64_t time = *(uint64_t *)(spe_packet + 1);
-                            uint64_t quot = time >> buf_header->time_shift;
-                            uint64_t rem = time & (((uint64_t)1 << buf_header->time_shift) - 1);
-                            time = buf_header->time_zero + quot * buf_header->time_mult +
-                                ((rem * buf_header->time_mult) >> buf_header->time_shift);
-                            time -= 4 * _clock_res;
-                            slot.pending_time = time;
-                            slot.pending_mask |= 0x1;
+                            flush_pending_spe_sample_locked(slot, writer, num_samples, false);
                             spe_packet_payload_size = 8;
                             break;
-                        }
                         default:
+                            _spe_unknown_packet_count += 1;
                             switch (spe_header & 0b110000) {
                             case 0b000000:
                                 spe_packet_payload_size = 1;
@@ -1277,25 +1925,6 @@ size_t Monitor::process_samples_locked(sampler_slot& slot)
                             }
                             break;
                         }
-                    }
-
-                    if ((slot.pending_mask & 0x7) == 0x7) {
-                        struct {
-                            uint64_t addr;
-                            uint64_t time;
-                            uint64_t pc;
-                        } sample2;
-                        sample2.addr = slot.pending_addr;
-                        sample2.time = slot.pending_time;
-                        sample2.pc = slot.pending_pc;
-                        writer.write((char *)&sample2, sizeof(sample2));
-                        _written_sample_bytes += sizeof(sample2);
-                        record_hotspot_sample(slot.tid, sample2.pc);
-                        num_samples++;
-                        slot.pending_mask = 0;
-                        slot.pending_time = 0;
-                        slot.pending_addr = 0;
-                        slot.pending_pc = 0;
                     }
 
                     it += spe_packet_header_size + spe_packet_payload_size;
@@ -1338,6 +1967,8 @@ void Monitor::fds_ioctl(int request)
             if (slot.fd >= 0)
                 ioctl(slot.fd, request, 0);
         }
+        if (kv.second.cost_fd >= 0)
+            ioctl(kv.second.cost_fd, request, 0);
     }
 }
 
@@ -1365,7 +1996,7 @@ void Monitor::start(const char *tag, bool offloaded)
 
     _kinfos.back().offloaded = offloaded;
 
-    if (!_nonstop_mode && _num_samplers)
+    if (!_nonstop_mode && _epoll_fd != -1)
         sem_wait(&_sampler_drain);
 
     snapshot_main_binary_path();

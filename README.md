@@ -76,7 +76,7 @@ make -C RD_SPE_TOOL kernel-clean
 
 ## 第一阶段：ARM SPE 热点发现
 
-第一阶段使用 `RD_MODE=perp`，通过 ARM SPE `ARM_SPE:LOADSTORE` 采样访存地址、时间和指令 PC。
+第一阶段使用 `RD_MODE=perp`，通过 ARM SPE `ARM_SPE:LOADSTORE` 采样访存指令 PC、latency counter 和 event packet，并按 `sample_count × avg_mem_latency` 的二维帕累托策略生成候选 PC。
 
 ```bash
 mkdir -p build
@@ -84,7 +84,6 @@ mkdir -p build
 env RD_ENABLE=1 \
     RD_MODE=perp \
     RD_PERIOD=100000 \
-    RD_HOTSPOT_TOP_K=6 \
     RD_NAME=build/spe_run \
     LD_PRELOAD=$PWD/RD_SPE_TOOL/lib/librd.so \
     ./your_program arg1 arg2
@@ -98,11 +97,20 @@ build/spe_run.hotpc
 build/spe_run.t<tid>.sample0
 ```
 
+如果设置 `RD_CALLPATH_COST=1`，第一阶段还会采集低频 `cpu-clock:u`
+调用栈样本，并输出：
+
+```text
+build/spe_run.t<tid>.cost.raw.bin
+```
+
 ARM SPE `.sample0` 记录布局固定为：
 
 ```text
-u64 addr, u64 time, u64 pc
+u64 pc, u64 lat_total, u64 lat_issue, u64 lat_xlat, u64 event_bits, u64 flags
 ```
+
+默认 `.hotpc` 输出每线程最多 12 条候选，作为稳定候选超集。当前机器第二阶段 execute breakpoint 资源有限时，建议用后处理生成 K=6 输入。
 
 `.hotpc` 使用模块文件偏移表示热点 PC：
 
@@ -117,7 +125,18 @@ pc_offset = pc - vm_start + file_offset
 ```bash
 python3 RD_SPE_TOOL/postproc/resolve_hotspots.py \
   build/spe_run.hotpc \
+  --emit-aggregate \
+  --select-targets 6 \
+  --selected-hotpc build/spe_run.k6.hotpc \
   --output build/spe_run.resolved.txt
+```
+
+该命令额外生成：
+
+```text
+build/spe_run.hotfunc.txt   函数级聚合摘要
+build/spe_run.hotbb.txt     近似基本块级聚合摘要
+build/spe_run.k6.hotpc      第二阶段建议输入
 ```
 
 ## 第二阶段：targeted RD
@@ -149,7 +168,7 @@ sudo insmod RD_SPE_TOOL/kernel/rd_wpctl.ko
 ```bash
 sudo bash -c "cd $PWD && env RD_ENABLE=1 \
   RD_MODE=targeted_rd \
-  RD_TARGET_FILE=build/spe_run.hotpc \
+  RD_TARGET_FILE=build/spe_run.k6.hotpc \
   RD_NAME=build/rd2_run \
   RD_BP_SAMPLE_PERIOD=1024 \
   RD_WP_CAPACITY=4 \
@@ -287,13 +306,15 @@ build/rd2_dwarf.dwarf.long_rd.report.md
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RD_PERIOD` | `0` | ARM SPE 采样周期；为 0 时不会产生 SPE 样本。 |
-| `RD_HOTSPOT_TOP_K` | `4` | 每线程写入 `.hotpc` 的主二进制热点 PC 数量。 |
+| `RD_HOTSPOT_TOP_K` | `12` | 每线程写入 `.hotpc` 的主二进制热点 PC 数量。建议第一阶段保留较大的候选超集，第二阶段再按 BP 资源裁剪。 |
+| `RD_CALLPATH_COST` | `0` | 第一阶段启用 `cpu-clock:u` 调用栈 cost 采样；输出 `.cost.raw.bin`，用于 `resolve_callpath_cost.py` 离线展开。 |
 
 ### 第二阶段变量
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `RD_TARGET_FILE` | 必填 | 第一阶段或 Rdbench 生成的 `.hotpc`。 |
+| `RD_BP_CAPACITY` | `6` | 第二阶段最多注册的唯一热点 PC 数；不应超过硬件 execute breakpoint 数量。 |
 | `RD_BP_SAMPLE_PERIOD` | `1024` | execute breakpoint 稀疏采样周期。 |
 | `RD_WP_CAPACITY` | `4` | 每线程 watchpoint slot 数量，不应超过硬件可用 watchpoint 数。 |
 | `RD_RD_EVENT` | `mem_access` | RD 轴事件名；当前只支持 `mem_access`。 |
@@ -307,6 +328,9 @@ build/rd2_dwarf.dwarf.long_rd.report.md
 
 ```bash
 python3 RD_SPE_TOOL/postproc/resolve_hotspots.py build/spe_run.hotpc \
+  --emit-aggregate \
+  --select-targets 6 \
+  --selected-hotpc build/spe_run.k6.hotpc \
   --output build/spe_run.resolved.txt
 ```
 

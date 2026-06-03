@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cinttypes>
@@ -14,6 +15,8 @@
 #include <memory>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include <asm/perf_regs.h>
 #include <fcntl.h>
@@ -25,6 +28,7 @@
 #include <unistd.h>
 
 #include "rd_exception.hh"
+#include "pthread_hook.hh"
 #include "threads.hh"
 
 /**
@@ -35,9 +39,20 @@
 namespace {
 
 constexpr uint32_t DEFAULT_WP_CAPACITY = 4;
+constexpr uint32_t DEFAULT_BP_CAPACITY = 6;
 constexpr uint64_t DEFAULT_BP_SAMPLE_PERIOD = 1024;
 constexpr uint32_t DEFAULT_DWARF_STACK_BYTES = 8192;
 constexpr uint32_t DEFAULT_DWARF_EVENT_CAPACITY = 16384;
+
+/** @brief `.rd2.info` 中落盘的当前进程可执行映射项。 */
+struct runtime_module_map
+{
+    uint32_t module_id;
+    uint64_t vm_start;
+    uint64_t vm_end;
+    uint64_t file_offset;
+    std::string path;
+};
 
 /** @brief 兼容方式获取当前线程 ID。 */
 static int gettid_portable()
@@ -456,6 +471,52 @@ static uint64_t resolve_absolute_pc(const std::string& binary_path, uint64_t pc_
     throw RdException("cannot resolve current absolute PC for hotspot offset 0x" + hex_u64(pc_offset));
 }
 
+/** @brief 抓取当前运行 `/proc/self/maps` 的可执行映射，供离线 DSO 归因使用。 */
+static std::vector<runtime_module_map> snapshot_runtime_module_maps()
+{
+    std::vector<runtime_module_map> modules;
+    std::ifstream maps("/proc/self/maps");
+    if (!maps.is_open())
+        return modules;
+
+    std::string line;
+    while (std::getline(maps, line)) {
+        std::istringstream iss(line);
+        std::string range;
+        std::string perms;
+        std::string offset_hex;
+        std::string dev;
+        std::string inode;
+        if (!(iss >> range >> perms >> offset_hex >> dev >> inode))
+            continue;
+        if (perms.size() < 3 || perms[2] != 'x')
+            continue;
+
+        std::string path;
+        std::getline(iss, path);
+        path = normalize_filesystem_path(trim_ascii_space(path));
+        if (path.empty())
+            continue;
+
+        char *dash = nullptr;
+        uint64_t vm_start = strtoull(range.c_str(), &dash, 16);
+        if (!dash || *dash != '-')
+            continue;
+        uint64_t vm_end = strtoull(dash + 1, nullptr, 16);
+        uint64_t file_offset = strtoull(offset_hex.c_str(), nullptr, 16);
+
+        runtime_module_map entry = {};
+        entry.module_id = (uint32_t)modules.size();
+        entry.vm_start = vm_start;
+        entry.vm_end = vm_end;
+        entry.file_offset = file_offset;
+        entry.path = path;
+        modules.push_back(entry);
+    }
+
+    return modules;
+}
+
 /** @brief 把用户态模板转换为 ioctl/UAPI 结构。 */
 static rd_wpctl_decode to_uapi_decode(const TargetedRdProfiler::decode_template& dec)
 {
@@ -522,6 +583,7 @@ TargetedRdProfiler::TargetedRdProfiler(const char *profile_name, bool is_pin)
     , _num_cpus(get_nprocs())
     , _device_fd(-1)
     , _watchpoint_capacity(DEFAULT_WP_CAPACITY)
+    , _bp_capacity(DEFAULT_BP_CAPACITY)
     , _bp_sample_period(DEFAULT_BP_SAMPLE_PERIOD)
     , _callchain_mode(RD_CALLCHAIN_OFF)
     , _dwarf_stack_bytes(DEFAULT_DWARF_STACK_BYTES)
@@ -529,6 +591,8 @@ TargetedRdProfiler::TargetedRdProfiler(const char *profile_name, bool is_pin)
     , _nameprefix(profile_name ? profile_name : "rd")
     , _rd_event_name("mem_access")
     , _instruction_support("aarch64 objdump-parsed ldr/str/ldur/stur with [base], [base,#imm], [base,index{,extend #shift}]")
+    , _candidate_target_count(0)
+    , _capacity_truncated_target_count(0)
 {
     const char *target_file = getenv("RD_TARGET_FILE");
     if (!target_file || !*target_file)
@@ -541,6 +605,14 @@ TargetedRdProfiler::TargetedRdProfiler(const char *profile_name, bool is_pin)
         if (v <= 0)
             throw RdException("RD_WP_CAPACITY must be positive");
         _watchpoint_capacity = (uint32_t)v;
+    }
+
+    const char *env_bp_capacity = getenv("RD_BP_CAPACITY");
+    if (env_bp_capacity && *env_bp_capacity) {
+        long v = strtol(env_bp_capacity, nullptr, 10);
+        if (v <= 0)
+            throw RdException("RD_BP_CAPACITY must be positive");
+        _bp_capacity = (uint32_t)v;
     }
 
     const char *env_bp_sample_period = getenv("RD_BP_SAMPLE_PERIOD");
@@ -620,6 +692,9 @@ TargetedRdProfiler::~TargetedRdProfiler()
             std::lock_guard<std::mutex> lock(_state_mutex);
             if (_window_open)
                 stop_window_locked();
+        }
+        {
+            std::lock_guard<std::mutex> lock(_state_mutex);
             for (auto& kv : _threads) {
                 if (kv.second.active)
                     unregister_thread_locked(kv.first);
@@ -740,8 +815,14 @@ void TargetedRdProfiler::load_targets()
     if (!in.is_open())
         throw RdException("cannot open hotspot manifest " + _target_file);
 
+    struct aggregated_hotspot {
+        uint64_t sample_count;
+        uint64_t candidate_score;
+        bool has_candidate_score;
+    };
+
     std::string manifest_main_binary;
-    std::unordered_map<uint64_t, uint64_t> aggregated;
+    std::unordered_map<uint64_t, aggregated_hotspot> aggregated;
 
     std::string line;
     while (std::getline(in, line)) {
@@ -760,7 +841,12 @@ void TargetedRdProfiler::load_targets()
         std::string path = normalize_filesystem_path(fields[5]);
         if (!path.empty() && path != _main_binary_path)
             throw RdException("targeted_rd only supports main binary hotspots; got " + path);
-        aggregated[pc_offset] += sample_count;
+        aggregated_hotspot& item = aggregated[pc_offset];
+        item.sample_count += sample_count;
+        if (fields.size() >= 8) {
+            item.candidate_score += strtoull(fields[7].c_str(), nullptr, 10);
+            item.has_candidate_score = true;
+        }
     }
 
     if (!manifest_main_binary.empty() && manifest_main_binary != _main_binary_path)
@@ -769,21 +855,33 @@ void TargetedRdProfiler::load_targets()
     if (aggregated.empty())
         throw RdException("no hotspots found in " + _target_file);
 
-    std::vector<std::pair<uint64_t, uint64_t>> order(aggregated.begin(), aggregated.end());
+    std::vector<std::pair<uint64_t, aggregated_hotspot>> order(aggregated.begin(), aggregated.end());
+    _candidate_target_count = (uint32_t)std::min<size_t>(order.size(), UINT32_MAX);
+    _capacity_truncated_target_count = 0;
     std::sort(order.begin(), order.end(),
-        [](const std::pair<uint64_t, uint64_t>& a, const std::pair<uint64_t, uint64_t>& b) {
-            if (a.second != b.second)
-                return a.second > b.second;
+        [](const std::pair<uint64_t, aggregated_hotspot>& a,
+           const std::pair<uint64_t, aggregated_hotspot>& b) {
+            uint64_t a_score = a.second.has_candidate_score ? a.second.candidate_score : a.second.sample_count;
+            uint64_t b_score = b.second.has_candidate_score ? b.second.candidate_score : b.second.sample_count;
+            if (a_score != b_score)
+                return a_score > b_score;
+            if (a.second.sample_count != b.second.sample_count)
+                return a.second.sample_count > b.second.sample_count;
             return a.first < b.first;
         });
 
     _targets.clear();
     _rejected_targets.clear();
-    _targets.reserve(order.size());
-    _rejected_targets.reserve(order.size());
-    for (const auto& kv : order) {
+    _targets.reserve(std::min<size_t>(order.size(), _bp_capacity));
+    _rejected_targets.reserve(std::min<size_t>(order.size(), _bp_capacity));
+    for (size_t index = 0; index < order.size(); index++) {
+        if (_targets.size() >= _bp_capacity) {
+            _capacity_truncated_target_count = (uint32_t)std::min<size_t>(order.size() - index, UINT32_MAX);
+            break;
+        }
+        const auto& kv = order[index];
         try {
-            hot_target target = decode_target_via_objdump(_main_binary_path, kv.first, kv.second);
+            hot_target target = decode_target_via_objdump(_main_binary_path, kv.first, kv.second.sample_count);
             target.abs_pc = resolve_absolute_pc(_main_binary_path, kv.first);
             _targets.push_back(target);
         } catch (const RdException& e) {
@@ -792,7 +890,7 @@ void TargetedRdProfiler::load_targets()
 
             rejected_target rejected = {};
             rejected.pc_offset = kv.first;
-            rejected.aggregated_samples = kv.second;
+            rejected.aggregated_samples = kv.second.sample_count;
             rejected.reason = e.what();
             _rejected_targets.push_back(std::move(rejected));
         }
@@ -857,6 +955,7 @@ TargetedRdProfiler::thread_binding& TargetedRdProfiler::register_thread_locked(i
     binding.tid = tid;
     binding.cpu = allocate_cpu_locked();
     binding.active = false;
+    bool module_registered = false;
 
     try {
         pin_tid_to_cpu(tid, binding.cpu);
@@ -877,8 +976,14 @@ TargetedRdProfiler::thread_binding& TargetedRdProfiler::register_thread_locked(i
         reg.scratch_stride = binding.scratch_stride;
         if (ioctl(_device_fd, RDKIOC_REGISTER_THREAD, &reg) < 0)
             throw RdException(std::string("RDKIOC_REGISTER_THREAD failed: ") + strerror(errno));
+        module_registered = true;
         binding.active = true;
     } catch (...) {
+        if (module_registered) {
+            rd_wpctl_thread_arg arg = {};
+            arg.tid = tid;
+            ioctl(_device_fd, RDKIOC_UNREGISTER_THREAD, &arg);
+        }
         if (binding.scratch && binding.scratch != MAP_FAILED)
             munmap(binding.scratch, binding.scratch_bytes);
         release_cpu_locked(binding.cpu);
@@ -1122,14 +1227,30 @@ void TargetedRdProfiler::write_info()
         _info_file << "auto_window_discarded_on_first_explicit=1" << std::endl;
     _info_file << "target_file=" << _target_file << std::endl;
     _info_file << "main_binary=" << _main_binary_path << std::endl;
+    std::vector<runtime_module_map> module_maps = snapshot_runtime_module_maps();
+    _info_file << "pc_identity=raw_va" << std::endl;
+    _info_file << "module_map_version=1" << std::endl;
+    _info_file << "module_map_fields=module_id,path,vm_start,vm_end,file_offset" << std::endl;
+    _info_file << "module_map_count=" << module_maps.size() << std::endl;
+    for (const auto& entry : module_maps) {
+        _info_file << "module_map="
+                   << entry.module_id << "\t"
+                   << entry.path << "\t"
+                   << "0x" << std::hex << entry.vm_start << "\t"
+                   << "0x" << entry.vm_end << "\t"
+                   << "0x" << entry.file_offset << std::dec << std::endl;
+    }
     _info_file << "instruction_support=" << _instruction_support << std::endl;
     _info_file << "rd_event=" << _rd_event_name << std::endl;
     _info_file << "candidate_source=sparse_execute_breakpoint_samples" << std::endl;
     _info_file << "breakpoint_sample_period=" << _bp_sample_period << std::endl;
+    _info_file << "bp_capacity=" << _bp_capacity << std::endl;
     _info_file << "reservoir_capacity=" << _watchpoint_capacity << std::endl;
     _info_file << "watchpoint_count=" << _watchpoint_capacity << std::endl;
     _info_file << "target_filter_policy=drop_unsupported_hotspots" << std::endl;
-    _info_file << "requested_target_count=" << (_targets.size() + _rejected_targets.size()) << std::endl;
+    _info_file << "requested_target_count=" << _candidate_target_count << std::endl;
+    _info_file << "candidate_target_count=" << _candidate_target_count << std::endl;
+    _info_file << "capacity_truncated_target_count=" << _capacity_truncated_target_count << std::endl;
     _info_file << "rejected_target_count=" << _rejected_targets.size() << std::endl;
     _info_file << "cpu_binding=exclusive_process_local" << std::endl;
     _info_file << "target_count=" << _targets.size() << std::endl;

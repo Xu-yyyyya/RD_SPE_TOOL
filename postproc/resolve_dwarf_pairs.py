@@ -7,8 +7,9 @@ import argparse
 import ctypes
 import subprocess
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from elftools.elf.elffile import ELFFile
@@ -19,6 +20,21 @@ except ImportError as exc:
 
 RD_WPCTL_LOG2_BUCKETS = 64
 RD_WPCTL_MAX_DWARF_STACK_BYTES = 8192
+
+
+@dataclass(frozen=True)
+class ModuleMapEntry:
+    module_id: int
+    path: str
+    vm_start: int
+    vm_end: int
+    file_offset: int
+
+    def contains(self, ip: int) -> bool:
+        return self.vm_start <= ip < self.vm_end
+
+    def offset(self, ip: int) -> int:
+        return ip - self.vm_start + self.file_offset
 
 
 class Snapshot(ctypes.LittleEndianStructure):
@@ -74,6 +90,82 @@ def load_bias_from_info(path: Path) -> int:
             if len(parts) >= 3:
                 return int(parts[2], 16) - int(parts[1], 16)
     raise ValueError(f"no target= lines found in {path}")
+
+
+def parse_module_map(path: Path) -> List[ModuleMapEntry]:
+    modules: List[ModuleMapEntry] = []
+    with path.open() as fh:
+        for line in fh:
+            if not line.startswith("module_map="):
+                continue
+            parts = line.strip().split("=", 1)[1].split("\t")
+            if len(parts) < 5:
+                continue
+            modules.append(
+                ModuleMapEntry(
+                    module_id=int(parts[0], 10),
+                    path=parts[1],
+                    vm_start=int(parts[2], 16),
+                    vm_end=int(parts[3], 16),
+                    file_offset=int(parts[4], 16),
+                )
+            )
+    modules.sort(key=lambda m: (m.vm_start, m.vm_end))
+    return modules
+
+
+def find_module(modules: Sequence[ModuleMapEntry], ip: int) -> Optional[ModuleMapEntry]:
+    matches = [module for module in modules if module.contains(ip)]
+    if not matches:
+        return None
+    executable = [module for module in matches if module.path and not module.path.startswith("[")]
+    return executable[0] if executable else matches[0]
+
+
+def elf_load_size(binary: Path) -> int:
+    with binary.open("rb") as fh:
+        elf = ELFFile(fh)
+        end = 0
+        for segment in elf.iter_segments():
+            if segment.header.p_type != "PT_LOAD":
+                continue
+            end = max(end, int(segment.header.p_vaddr) + int(segment.header.p_memsz))
+        return end
+
+
+def load_function_symbols(module_path: str) -> List[Tuple[int, str]]:
+    path = Path(module_path)
+    if not path.exists() or path.name.startswith("["):
+        return []
+    symbols: List[Tuple[int, str]] = []
+    try:
+        with path.open("rb") as fh:
+            elf = ELFFile(fh)
+            for section_name in (".symtab", ".dynsym"):
+                section = elf.get_section_by_name(section_name)
+                if section is None:
+                    continue
+                for sym in section.iter_symbols():
+                    info = sym.entry.get("st_info")
+                    if info and info.get("type") != "STT_FUNC":
+                        continue
+                    value = int(sym.entry.st_value)
+                    if value and sym.name:
+                        symbols.append((value, sym.name))
+    except Exception:
+        return []
+    symbols.sort()
+    return symbols
+
+
+def nearest_symbol_name(symbols: Sequence[Tuple[int, str]], offset: int) -> Optional[str]:
+    best: Optional[Tuple[int, str]] = None
+    for value, name in symbols:
+        if value <= offset:
+            best = (value, name)
+        else:
+            break
+    return best[1] if best else None
 
 
 class CfiUnwinder:
@@ -219,6 +311,44 @@ def symbolize(binary: Path, load_bias: int, chain: Tuple[int, ...]) -> List[str]
     return [text for _ip, text in symbolize_frames(binary, load_bias, chain)]
 
 
+def symbolize_chain(
+    binary: Path,
+    load_bias: int,
+    main_size: int,
+    modules: Sequence[ModuleMapEntry],
+    chain: Tuple[int, ...],
+) -> List[Tuple[int, str]]:
+    frames: List[Tuple[int, str]] = []
+    symbol_cache: Dict[str, List[Tuple[int, str]]] = {}
+    binary_norm = str(binary.expanduser().resolve())
+    for index, ip in enumerate(chain):
+        adjusted_ip = ip - 4 if index > 0 else ip
+        module = find_module(modules, adjusted_ip)
+        if module is None:
+            main_offset = adjusted_ip - load_bias
+            if 0 <= main_offset < main_size:
+                frames.extend(symbolize_frames(binary, load_bias, (adjusted_ip,)))
+            else:
+                frames.append((ip, f"external frame [module_unresolved] at 0x{adjusted_ip:x} (module_unresolved + 0x{adjusted_ip:x})"))
+            continue
+
+        module_offset = module.offset(adjusted_ip)
+        module_path = module.path
+        try:
+            module_norm = str(Path(module_path).expanduser().resolve())
+        except OSError:
+            module_norm = module_path
+        if module_norm == binary_norm:
+            frames.extend(symbolize_frames(binary, load_bias, (adjusted_ip,)))
+            continue
+
+        symbols = symbol_cache.setdefault(module_path, load_function_symbols(module_path))
+        function = nearest_symbol_name(symbols, module_offset) or "unknown procedure"
+        module_name = Path(module_path).name if module_path else "external"
+        frames.append((ip, f"{function} [{module_name}] at 0x{module_offset:x} ({module_name} + 0x{module_offset:x})"))
+    return frames
+
+
 def render_call_tree(frames: List[Tuple[int, str]], hit_label: str, hit_pc: int) -> List[str]:
     """Render a leaf-first unwind chain as a root-to-hit ASCII call tree."""
     if not frames:
@@ -246,6 +376,15 @@ def chain_key(chain: List[int]) -> Tuple[int, ...]:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--info", required=True, type=Path)
+    parser.add_argument(
+        "--module-info",
+        type=Path,
+        help=(
+            "Optional .info file containing module_map= entries. Prefer the "
+            "same-run .rd2.info when it has mappings; a first-stage .info is "
+            "only address-accurate if mappings are stable across runs."
+        ),
+    )
     parser.add_argument("--raw", required=True, nargs="+", type=Path)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--output-prefix", type=Path)
@@ -260,6 +399,9 @@ def main() -> int:
         raise SystemExit(f"binary not found: {binary}")
     prefix = args.output_prefix or args.info.with_suffix("")
     load_bias = load_bias_from_info(args.info)
+    module_info = args.module_info or args.info
+    modules = parse_module_map(module_info)
+    main_size = elf_load_size(binary)
     events = load_events(args.raw)
 
     unwinder = CfiUnwinder(binary, load_bias)
@@ -290,6 +432,8 @@ def main() -> int:
             out.write("# DWARF Use-Reuse Calling Context Report\n\n")
             out.write(f"- events: {len(events)}\n")
             out.write(f"- groups: {len(grouped)}\n\n")
+            out.write(f"- module_map_source: `{module_info}`\n")
+            out.write(f"- module_map_entries: `{len(modules)}`\n\n")
             for rank, ((seed_chain, seed_off, reuse_chain, reuse_pc), buckets) in enumerate(ranked[: args.top], 1):
                 out.write(f"## Pair {rank}\n\n")
                 out.write(f"- seed_pc_offset: `0x{seed_off:x}`\n")
@@ -298,14 +442,14 @@ def main() -> int:
                 out.write("- buckets: " + ", ".join(f"[{lo},{hi}]={c}" for (lo, hi), c in sorted(buckets.items())) + "\n\n")
                 out.write("Use-side calling context tree:\n\n")
                 out.write("```text\n")
-                seed_frames = symbolize_frames(binary, load_bias, seed_chain)
+                seed_frames = symbolize_chain(binary, load_bias, main_size, modules, seed_chain)
                 for line in render_call_tree(seed_frames, "USE HIT", seed_chain[0] if seed_chain else 0):
                     out.write(line + "\n")
                 out.write("```\n\n")
 
                 out.write("Reuse-side calling context tree:\n\n")
                 out.write("```text\n")
-                reuse_frames = symbolize_frames(binary, load_bias, reuse_chain)
+                reuse_frames = symbolize_chain(binary, load_bias, main_size, modules, reuse_chain)
                 for line in render_call_tree(reuse_frames, "REUSE HIT", reuse_chain[0] if reuse_chain else 0):
                     out.write(line + "\n")
                 out.write("```\n\n")

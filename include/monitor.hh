@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <mutex>
 #include <unordered_map>
+#include <cstdint>
 #include <semaphore.h>
 
 /**
@@ -21,9 +22,14 @@
 #define SPE_PACKET_TS_HEADER 0x71
 #define SPE_PACKET_PADDING_HEADER 0x00
 #define SPE_PACKET_END_HEADER 0x01
+#define SPE_PACKET_HEADER_PAYLOAD_SIZE_MASK 0x30
 #define SPE_PACKET_SHORT_INDEX_MASK 0x07
+#define SPE_PACKET_EVENTS_MASK 0xCF
+#define SPE_PACKET_EVENTS_HEADER 0x42
 #define SPE_PACKET_ADDRESS_MASK 0xF8
 #define SPE_PACKET_ADDRESS_HEADER 0xB0
+#define SPE_PACKET_COUNTER_MASK 0xF8
+#define SPE_PACKET_COUNTER_HEADER 0x98
 
 #define SPE_ADDR_PKT_HDR_INDEX_INS 0x0
 #define SPE_ADDR_PKT_HDR_INDEX_BRANCH 0x1
@@ -31,9 +37,25 @@
 #define SPE_ADDR_PKT_HDR_INDEX_DATA_PHYS 0x3
 #define SPE_ADDR_PKT_HDR_INDEX_PREV_BRANCH 0x4
 
+#define SPE_CNT_PKT_HDR_INDEX_TOTAL_LAT 0x0
+#define SPE_CNT_PKT_HDR_INDEX_ISSUE_LAT 0x1
+#define SPE_CNT_PKT_HDR_INDEX_TRANS_LAT 0x2
+
+#define SPE_EVENT_L1D_REFILL 3
+#define SPE_EVENT_TLB_WALK 5
+#define SPE_EVENT_LLC_MISS 9
+#define SPE_EVENT_REMOTE_ACCESS 10
+
 #define SPE_ADDR_PKT_BYTE7_SHIFT 56
 #define SPE_ADDR_PKT_EL1 0x1
 #define SPE_ADDR_PKT_EL2 0x2
+
+#define SPE_SAMPLE_FLAG_PC_VALID (1ULL << 0)
+#define SPE_SAMPLE_FLAG_LAT_TOTAL_VALID (1ULL << 1)
+#define SPE_SAMPLE_FLAG_LAT_ISSUE_VALID (1ULL << 2)
+#define SPE_SAMPLE_FLAG_LAT_XLAT_VALID (1ULL << 3)
+#define SPE_SAMPLE_FLAG_EVENTS_VALID (1ULL << 4)
+#define SPE_SAMPLE_FLAG_LAT_EXEC_VALID (1ULL << 5)
 
 /**
  * @brief 描述一组 perf 事件的规格。
@@ -140,7 +162,77 @@ struct hotspot_summary
     uint32_t module_id;
     uint64_t pc_offset;
     uint64_t sample_count;
+    uint64_t pareto_front;
+    uint64_t candidate_score;
+    std::string candidate_metric;
+    double avg_mem_latency;
+    uint64_t lat_total_sum;
+    uint64_t lat_issue_sum;
+    uint64_t lat_xlat_sum;
+    uint64_t lat_exec_sum;
+    uint64_t l1d_refill_count;
+    uint64_t llc_miss_count;
+    uint64_t tlb_walk_count;
+    uint64_t remote_access_count;
     std::string path;
+};
+
+/**
+ * @brief ARM SPE 第一阶段落盘的指令级样本记录。
+ *
+ * 该格式不再保存 data VA 和 timestamp，只保存当前 sampled instruction
+ * 的 PC、latency counter、event packet 和有效性标记。
+ */
+struct spe_instruction_sample
+{
+    uint64_t pc;
+    uint64_t lat_total;
+    uint64_t lat_issue;
+    uint64_t lat_xlat;
+    uint64_t event_bits;
+    uint64_t flags;
+};
+
+/**
+ * @brief 第一阶段 cpu-clock 调用栈 cost 采样的固定宽度 raw record。
+ *
+ * 该布局与后处理脚本 `resolve_callpath_cost.py` 保持一致。第一阶段只负责
+ * 保存 perf sample 中的用户态寄存器和栈快照，不在线展开调用栈。
+ */
+struct callpath_cost_raw_record
+{
+    uint32_t magic;
+    uint16_t version;
+    uint16_t header_size;
+    uint32_t tid;
+    uint32_t cpu;
+    uint64_t time;
+    uint64_t ip;
+    uint64_t regs_mask;
+    uint64_t regs[33];
+    uint32_t stack_size;
+    uint32_t dyn_stack_size;
+    uint8_t stack[8192];
+};
+
+/**
+ * @brief 聚合一个热点 PC 的 SPE 指令级统计。
+ */
+struct hotspot_stats
+{
+    uint64_t sample_count;
+    uint64_t lat_total_sum;
+    uint64_t lat_total_count;
+    uint64_t lat_issue_sum;
+    uint64_t lat_issue_count;
+    uint64_t lat_xlat_sum;
+    uint64_t lat_xlat_count;
+    uint64_t lat_exec_sum;
+    uint64_t lat_exec_count;
+    uint64_t l1d_refill_count;
+    uint64_t llc_miss_count;
+    uint64_t tlb_walk_count;
+    uint64_t remote_access_count;
 };
 
 /**
@@ -186,8 +278,9 @@ private:
 /**
  * @brief 表示一个 sampler fd 及其映射缓冲区。
  *
- * 对于 ARM SPE，`pending_*` 字段用于跨 packet 拼接 `time + data VA + pc`
- * 三元组，只有三者齐备才会落盘。
+ * 对于 ARM SPE，`pending_*` 字段用于跨 packet 拼接一条 sampled
+ * instruction 的 `pc + latency + event_bits`，遇到 time/end packet 后
+ * flush 到 `.sample0`。
  */
 struct sampler_slot
 {
@@ -199,10 +292,12 @@ struct sampler_slot
     size_t ringbuf_bytes;
     void *auxbuf;
     size_t auxbuf_bytes;
-    uint64_t pending_time;
-    uint64_t pending_addr;
     uint64_t pending_pc;
-    uint8_t pending_mask;
+    uint64_t pending_lat_total;
+    uint64_t pending_lat_issue;
+    uint64_t pending_lat_xlat;
+    uint64_t pending_event_bits;
+    uint64_t pending_flags;
 };
 
 /**
@@ -215,6 +310,15 @@ struct thread_state
     std::vector<int> counter_fds;
     std::vector<BinaryWriter> writers;
     std::vector<sampler_slot> samplers;
+    int cost_fd;
+    int cost_output_fd;
+    void *cost_mmap_base;
+    size_t cost_mmap_len;
+    size_t cost_data_size;
+    uint64_t cost_samples;
+    uint64_t cost_lost_samples;
+    uint64_t cost_invalid_samples;
+    bool cost_epoll_registered;
 };
 
 /**
@@ -360,6 +464,18 @@ private:
     int _event_fd;
     /** @brief 监听 sampler fd 与 eventfd 的 epoll fd。 */
     int _epoll_fd;
+    /** @brief 是否在第一阶段启用 cpu-clock 调用栈 cost 采样。 */
+    bool _callpath_cost_enabled;
+    /** @brief cost sampler 的默认采样频率。 */
+    uint32_t _cost_sample_freq;
+    /** @brief 每个 cost sample 复制的用户栈字节数。 */
+    uint32_t _cost_stack_bytes;
+    /** @brief 每个线程 cost perf ring 的数据页数。 */
+    uint32_t _cost_ring_pages;
+    /** @brief drain 线程尽量绑定的 CPU。 */
+    int _cost_consumer_cpu;
+    /** @brief cost perf fd 到 tid 的路由表。 */
+    std::unordered_map<int, int> _cost_fd_to_tid;
 
     /**
      * @brief 序列化窗口之间的样本 drain。
@@ -384,12 +500,24 @@ private:
     std::vector<module_map_entry> _module_maps;
     /** @brief 当前主二进制绝对路径。 */
     std::string _main_binary_path;
-    /** @brief 每线程热点样本计数。 */
-    std::unordered_map<int, std::unordered_map<hotspot_key, uint64_t, hotspot_key_hash>> _thread_hotspots;
+    /** @brief 每线程热点样本聚合统计。 */
+    std::unordered_map<int, std::unordered_map<hotspot_key, hotspot_stats, hotspot_key_hash>> _thread_hotspots;
     /** @brief 每线程导出的热点数上限。 */
     size_t _hotspot_top_k;
+    /** @brief 进入帕累托候选的最低样本数。 */
+    size_t _hotspot_min_samples;
+    /** @brief 进入帕累托候选的最低 latency 样本数。 */
+    size_t _hotspot_min_latency_samples;
     /** @brief 无法映射到模块的 PC 样本数。 */
     uint64_t _hotspot_unmapped_samples;
+    /** @brief 由 SPE timestamp packet 触发并成功写出的记录数。 */
+    uint64_t _spe_time_packet_flush_count;
+    /** @brief 由 SPE end packet 触发并成功写出的记录数。 */
+    uint64_t _spe_end_packet_flush_count;
+    /** @brief flush 时缺少 PC 而丢弃的 pending 记录数。 */
+    uint64_t _spe_empty_flush_count;
+    /** @brief SPE parser 遇到但无法识别的 packet 数。 */
+    uint64_t _spe_unknown_packet_count;
 
     /** @brief 在持锁状态下注册指定线程。 */
     thread_state& register_thread_locked(int tid);
@@ -402,7 +530,7 @@ private:
     /** @brief enable 一个线程上的所有事件。 */
     void enable_thread_locked(thread_state& state);
     /** @brief 将即将退役线程的计数并入全局累计值。 */
-    void accumulate_retired_counts_locked(const thread_state& state);
+    void accumulate_retired_counts_locked(thread_state& state);
     /** @brief 关闭并回收一个线程上的所有 perf 资源。 */
     void close_thread_locked(thread_state& state);
     /** @brief 查找指定线程状态；未找到则返回空指针。 */
@@ -413,8 +541,20 @@ private:
     void run_sampler_thread();
     /** @brief 按 slot ID 处理一条 sampler 通道。 */
     size_t process_samples(int slot_id);
+    /** @brief 按 fd drain 一条 cpu-clock cost 通道。 */
+    void process_cost_samples(int fd);
     /** @brief 在持锁状态下 drain 指定 sampler slot。 */
     size_t process_samples_locked(sampler_slot& slot);
+    /** @brief 为一个线程创建第一阶段 cpu-clock cost sampler。 */
+    void setup_cost_sampler_locked(thread_state& state);
+    /** @brief 释放一个线程的第一阶段 cpu-clock cost sampler。 */
+    void teardown_cost_sampler_locked(thread_state& state);
+    /** @brief 将线程 cost fd 加入 epoll。 */
+    void register_cost_fd_epoll_locked(thread_state& state);
+    /** @brief 将线程 cost fd 从 epoll 删除。 */
+    void unregister_cost_fd_epoll_locked(thread_state& state);
+    /** @brief 在持锁状态下 drain 指定线程 cost perf ring。 */
+    void consume_cost_samples_locked(thread_state& state);
     /** @brief 将所有统计写入 `.info`。 */
     void write_info(std::ofstream& info);
     /** @brief 判断 sampler 规格中是否包含 ARM SPE。 */
@@ -435,8 +575,13 @@ private:
     const module_map_entry *find_module_map(uint64_t pc) const;
     /** @brief 判断某模块是否为主二进制模块。 */
     bool is_main_binary_module(const module_map_entry& entry) const;
+    /** @brief 重置一个 sampler slot 中的 pending SPE 样本。 */
+    void reset_pending_spe_sample(sampler_slot& slot) const;
+    /** @brief 写出并聚合一个 pending SPE 指令样本。 */
+    bool flush_pending_spe_sample_locked(sampler_slot& slot, BinaryWriter& writer, size_t& num_samples,
+        bool from_end_packet);
     /** @brief 记录一条热点 PC 样本。 */
-    void record_hotspot_sample(int tid, uint64_t pc);
+    void record_hotspot_sample(int tid, const spe_instruction_sample& sample);
     /** @brief 汇总一个线程的热点列表。 */
     std::vector<hotspot_summary> collect_hotspots_for_thread(int tid) const;
     /** @brief 写出 `.hotpc` manifest。 */

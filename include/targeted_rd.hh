@@ -177,6 +177,8 @@ private:
     int _device_fd;
     /** @brief 每线程 watchpoint 水库容量。 */
     uint32_t _watchpoint_capacity;
+    /** @brief 每线程最多注册的 execute breakpoint 目标 PC 数。 */
+    uint32_t _bp_capacity;
     /** @brief execute breakpoint 的稀疏采样周期。 */
     uint64_t _bp_sample_period;
     /** @brief 调用上下文采集模式。 */
@@ -195,6 +197,10 @@ private:
     std::string _main_binary_path;
     /** @brief 写入 `.rd2.info` 的指令支持说明。 */
     std::string _instruction_support;
+    /** @brief `.hotpc` 聚合后的唯一候选 PC 数。 */
+    uint32_t _candidate_target_count;
+    /** @brief 因 `_bp_capacity` 限制未下发到内核的候选 PC 数。 */
+    uint32_t _capacity_truncated_target_count;
     /** @brief 保护线程绑定与窗口状态。 */
     std::mutex _state_mutex;
     /** @brief 输出 `.rd2.info` 的文件流。 */
