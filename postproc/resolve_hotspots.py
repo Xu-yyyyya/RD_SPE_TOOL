@@ -24,7 +24,9 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".C", ".h", ".hh", ".hpp", ".hxx"}
+HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx"}
+FORTRAN_SUFFIXES = {".f", ".F", ".for", ".FOR", ".f90", ".F90", ".f95", ".F95"}
+SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".C"} | HEADER_SUFFIXES | FORTRAN_SUFFIXES
 LOC_RE = re.compile(r"^(?P<file>.*?):(?P<line>\d+)(?::(?P<column>\d+))?(?:\s.*)?$")
 DISASM_RE = re.compile(
     r"^\s*(?P<addr>[0-9a-fA-F]+):\s+"
@@ -209,12 +211,28 @@ def display_path(path: str | Path, source_root: Optional[Path]) -> str:
     if not path:
         return ""
     p = Path(path)
+    suffix = p.suffix
+    if suffix in HEADER_SUFFIXES:
+        return normalize_path(p)
+    if suffix in SOURCE_SUFFIXES:
+        return p.name
     if source_root:
         try:
             return str(p.resolve().relative_to(source_root.resolve()))
         except Exception:
             pass
-    return str(p)
+    return normalize_path(p)
+
+
+def display_artifact_path(path: str | Path) -> str:
+    """Return a compact path for report metadata, without changing data files."""
+    if not path:
+        return ""
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(Path.cwd().resolve()))
+    except Exception:
+        return p.name
 
 
 def path_under_root(path: str, source_root: Optional[Path]) -> bool:
@@ -1068,12 +1086,12 @@ def write_report(
 
     with path.open("w", encoding="utf-8") as out:
         out.write("# Hotspot Source Attribution Report\n\n")
-        out.write(f"- hotpc: `{hotpc_path}`\n")
-        out.write(f"- filtered_hotpc: `{filtered_hotpc_path}`\n")
+        out.write(f"- hotpc: `{display_artifact_path(hotpc_path)}`\n")
+        out.write(f"- filtered_hotpc: `{display_artifact_path(filtered_hotpc_path)}`\n")
         if info_path:
-            out.write(f"- info: `{info_path}`\n")
+            out.write(f"- info: `{display_artifact_path(info_path)}`\n")
         if source_root:
-            out.write(f"- source_root: `{source_root}`\n")
+            out.write(f"- source_root: `{display_artifact_path(source_root)}`\n")
         out.write(f"- unique_instruction_pcs: {len(resolved)}\n\n")
         if diagnostics:
             out.write("## Attribution Diagnostics\n\n")

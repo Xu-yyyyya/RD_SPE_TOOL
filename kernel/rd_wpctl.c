@@ -176,7 +176,7 @@ struct rd_session {
 	pid_t owner_tgid;
 	bool running;
 	bool configured;
-	bool targets_loaded;
+	bool targets_loaded; 
 
 	u32 wp_capacity;
 	u32 callchain_mode;

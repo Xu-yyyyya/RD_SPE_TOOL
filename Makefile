@@ -31,7 +31,6 @@ $(TEST) bin/stream: $(DESTDIR)/librd.a
 
 bin/stream: CFLAGS += -fopenmp
 bin/rd_test: CXXFLAGS += -std=c++17
-bin/test_callpath_loop_tree: CXXFLAGS += -fopenmp -fno-omit-frame-pointer -fno-optimize-sibling-calls
 bin/test_targeted_rd_callchain_pair: CFLAGS += -fno-omit-frame-pointer -fno-optimize-sibling-calls
 bin/test_targeted_rd_dwarf_callchain_pair: CFLAGS += -fomit-frame-pointer -fno-optimize-sibling-calls
 bin/setup_waste: LDLIBS=-lnuma

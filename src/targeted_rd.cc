@@ -1230,6 +1230,7 @@ void TargetedRdProfiler::write_info()
     std::vector<runtime_module_map> module_maps = snapshot_runtime_module_maps();
     _info_file << "pc_identity=raw_va" << std::endl;
     _info_file << "module_map_version=1" << std::endl;
+    _info_file << "module_map_scope=targeted_rd_current_run" << std::endl;
     _info_file << "module_map_fields=module_id,path,vm_start,vm_end,file_offset" << std::endl;
     _info_file << "module_map_count=" << module_maps.size() << std::endl;
     for (const auto& entry : module_maps) {

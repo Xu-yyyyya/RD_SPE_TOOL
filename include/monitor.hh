@@ -194,28 +194,6 @@ struct spe_instruction_sample
 };
 
 /**
- * @brief 第一阶段 cpu-clock 调用栈 cost 采样的固定宽度 raw record。
- *
- * 该布局与后处理脚本 `resolve_callpath_cost.py` 保持一致。第一阶段只负责
- * 保存 perf sample 中的用户态寄存器和栈快照，不在线展开调用栈。
- */
-struct callpath_cost_raw_record
-{
-    uint32_t magic;
-    uint16_t version;
-    uint16_t header_size;
-    uint32_t tid;
-    uint32_t cpu;
-    uint64_t time;
-    uint64_t ip;
-    uint64_t regs_mask;
-    uint64_t regs[33];
-    uint32_t stack_size;
-    uint32_t dyn_stack_size;
-    uint8_t stack[8192];
-};
-
-/**
  * @brief 聚合一个热点 PC 的 SPE 指令级统计。
  */
 struct hotspot_stats
@@ -310,15 +288,6 @@ struct thread_state
     std::vector<int> counter_fds;
     std::vector<BinaryWriter> writers;
     std::vector<sampler_slot> samplers;
-    int cost_fd;
-    int cost_output_fd;
-    void *cost_mmap_base;
-    size_t cost_mmap_len;
-    size_t cost_data_size;
-    uint64_t cost_samples;
-    uint64_t cost_lost_samples;
-    uint64_t cost_invalid_samples;
-    bool cost_epoll_registered;
 };
 
 /**
@@ -464,18 +433,6 @@ private:
     int _event_fd;
     /** @brief 监听 sampler fd 与 eventfd 的 epoll fd。 */
     int _epoll_fd;
-    /** @brief 是否在第一阶段启用 cpu-clock 调用栈 cost 采样。 */
-    bool _callpath_cost_enabled;
-    /** @brief cost sampler 的默认采样频率。 */
-    uint32_t _cost_sample_freq;
-    /** @brief 每个 cost sample 复制的用户栈字节数。 */
-    uint32_t _cost_stack_bytes;
-    /** @brief 每个线程 cost perf ring 的数据页数。 */
-    uint32_t _cost_ring_pages;
-    /** @brief drain 线程尽量绑定的 CPU。 */
-    int _cost_consumer_cpu;
-    /** @brief cost perf fd 到 tid 的路由表。 */
-    std::unordered_map<int, int> _cost_fd_to_tid;
 
     /**
      * @brief 序列化窗口之间的样本 drain。
@@ -541,20 +498,8 @@ private:
     void run_sampler_thread();
     /** @brief 按 slot ID 处理一条 sampler 通道。 */
     size_t process_samples(int slot_id);
-    /** @brief 按 fd drain 一条 cpu-clock cost 通道。 */
-    void process_cost_samples(int fd);
     /** @brief 在持锁状态下 drain 指定 sampler slot。 */
     size_t process_samples_locked(sampler_slot& slot);
-    /** @brief 为一个线程创建第一阶段 cpu-clock cost sampler。 */
-    void setup_cost_sampler_locked(thread_state& state);
-    /** @brief 释放一个线程的第一阶段 cpu-clock cost sampler。 */
-    void teardown_cost_sampler_locked(thread_state& state);
-    /** @brief 将线程 cost fd 加入 epoll。 */
-    void register_cost_fd_epoll_locked(thread_state& state);
-    /** @brief 将线程 cost fd 从 epoll 删除。 */
-    void unregister_cost_fd_epoll_locked(thread_state& state);
-    /** @brief 在持锁状态下 drain 指定线程 cost perf ring。 */
-    void consume_cost_samples_locked(thread_state& state);
     /** @brief 将所有统计写入 `.info`。 */
     void write_info(std::ofstream& info);
     /** @brief 判断 sampler 规格中是否包含 ARM SPE。 */

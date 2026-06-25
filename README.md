@@ -97,13 +97,6 @@ build/spe_run.hotpc
 build/spe_run.t<tid>.sample0
 ```
 
-如果设置 `RD_CALLPATH_COST=1`，第一阶段还会采集低频 `cpu-clock:u`
-调用栈样本，并输出：
-
-```text
-build/spe_run.t<tid>.cost.raw.bin
-```
-
 ARM SPE `.sample0` 记录布局固定为：
 
 ```text
@@ -307,7 +300,6 @@ build/rd2_dwarf.dwarf.long_rd.report.md
 | --- | --- | --- |
 | `RD_PERIOD` | `0` | ARM SPE 采样周期；为 0 时不会产生 SPE 样本。 |
 | `RD_HOTSPOT_TOP_K` | `12` | 每线程写入 `.hotpc` 的主二进制热点 PC 数量。建议第一阶段保留较大的候选超集，第二阶段再按 BP 资源裁剪。 |
-| `RD_CALLPATH_COST` | `0` | 第一阶段启用 `cpu-clock:u` 调用栈 cost 采样；输出 `.cost.raw.bin`，用于 `resolve_callpath_cost.py` 离线展开。 |
 
 ### 第二阶段变量
 

@@ -13,6 +13,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import PercentFormatter
 
+from rd_format import format_rd_bucket
+
 
 Bucket = Tuple[int, int]
 OUT_DIR = Path(__file__).resolve().parent / "out"
@@ -44,10 +46,7 @@ def padded_buckets(expected: Dict[Bucket, int], observed: Dict[Bucket, int], x_m
 
 
 def bucket_label(bucket: Bucket) -> str:
-    lo, hi = bucket
-    if lo == hi:
-        return str(lo)
-    return f"{lo}-{hi}"
+    return format_rd_bucket(bucket)
 
 
 def parse_global_expected(manifest: Path) -> Dict[Bucket, int]:

@@ -12,11 +12,8 @@
 #include <sys/eventfd.h>
 #include <sys/epoll.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
 #include <sys/sysinfo.h>
-#include <asm/perf_regs.h>
 #include <unistd.h>
-#include <fcntl.h>
 #include <sched.h>
 #include "monitor.hh"
 #include "threads.hh"
@@ -34,16 +31,9 @@
 
 #define EVENTFD_TOKEN 0U
 #define SAMPLER_TOKEN_KIND 1ULL
-#define COST_TOKEN_KIND 2ULL
 #define SAMPLER_DRAIN 1
 #define SAMPLER_STOP 2
 #define DEFAULT_HOTSPOT_TOP_K 12
-#define DEFAULT_COST_SAMPLE_FREQ 99U
-#define DEFAULT_COST_STACK_BYTES 8192U
-#define DEFAULT_COST_RING_PAGES 64U
-#define COST_RAW_MAGIC 0x43524452U
-#define COST_RAW_VERSION 1U
-#define ARM64_USER_REGS_MASK ((1ULL << PERF_REG_ARM64_MAX) - 1ULL)
 
 #ifndef PERF_AUX_FLAG_COLLISION
 #define PERF_AUX_FLAG_COLLISION 0x8
@@ -59,40 +49,6 @@ struct read_format {
 static uint64_t make_sampler_token(uint32_t slot_id)
 {
     return (SAMPLER_TOKEN_KIND << 32) | slot_id;
-}
-
-/** @brief 构造 epoll 中 cost fd 的稳定 token。 */
-static uint64_t make_cost_token(uint32_t fd)
-{
-    return (COST_TOKEN_KIND << 32) | fd;
-}
-
-/** @brief perf_event_open syscall wrapper。 */
-static int perf_event_open_sys(struct perf_event_attr *attr, pid_t pid, int cpu, int group_fd,
-    unsigned long flags)
-{
-    return (int)syscall(SYS_perf_event_open, attr, pid, cpu, group_fd, flags);
-}
-
-/** @brief 从 perf ring 中按环形 offset 拷贝一段数据。 */
-static void perf_ring_copy(const uint8_t *data, size_t data_size, uint64_t offset, void *dst, size_t len)
-{
-    size_t begin = (size_t)(offset % data_size);
-    size_t first = std::min(len, data_size - begin);
-    memcpy(dst, data + begin, first);
-    if (first < len)
-        memcpy((uint8_t *)dst + first, data, len - first);
-}
-
-/** @brief 从 perf sample payload 中读取一个 POD 字段。 */
-template <typename T>
-static bool read_sample_field(const uint8_t *buf, size_t size, size_t& off, T& out)
-{
-    if (off + sizeof(T) > size)
-        return false;
-    memcpy(&out, buf + off, sizeof(T));
-    off += sizeof(T);
-    return true;
 }
 
 /** @brief 读取一个 perf fd 的 value/time_enabled/time_running。 */
@@ -374,11 +330,6 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
     , _is_pin(is_pin)
     , _event_fd(-1)
     , _epoll_fd(-1)
-    , _callpath_cost_enabled(false)
-    , _cost_sample_freq(DEFAULT_COST_SAMPLE_FREQ)
-    , _cost_stack_bytes(DEFAULT_COST_STACK_BYTES)
-    , _cost_ring_pages(DEFAULT_COST_RING_PAGES)
-    , _cost_consumer_cpu(-1)
     , _hotspot_top_k(DEFAULT_HOTSPOT_TOP_K)
     , _hotspot_min_samples(1)
     , _hotspot_min_latency_samples(1)
@@ -391,16 +342,6 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
     const char *env_hotspot_top_k = getenv("RD_HOTSPOT_TOP_K");
     const char *env_hotspot_min_samples = getenv("RD_HOTPC_MIN_SAMPLES");
     const char *env_hotspot_min_latency_samples = getenv("RD_HOTPC_MIN_LATENCY_SAMPLES");
-    const char *env_callpath_cost = getenv("RD_CALLPATH_COST");
-
-    if (env_callpath_cost && *env_callpath_cost) {
-        char *end = nullptr;
-        long value = strtol(env_callpath_cost, &end, 10);
-
-        if (!end || *end != '\0' || (value != 0 && value != 1))
-            throw RdException("RD_CALLPATH_COST must be 0 or 1");
-        _callpath_cost_enabled = (value == 1);
-    }
 
     if (env_hotspot_top_k && *env_hotspot_top_k) {
         char *end = nullptr;
@@ -442,7 +383,7 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
         throw RdException("clock_getres failure (CLOCK_MONOTONIC_RAW)");
     _clock_res = res.tv_nsec * 1000000000ULL;
 
-    if (_num_samplers > 0 || _callpath_cost_enabled) {
+    if (_num_samplers > 0) {
         _epoll_fd = epoll_create(1024);
         if (_epoll_fd < 0)
             throw RdException("epoll_create failed");
@@ -467,9 +408,6 @@ Monitor::Monitor(const event_spec counter_spec, const event_spec sampler_spec, u
         ep_event.data.u32 = EVENTFD_TOKEN;
         if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, _event_fd, &ep_event) < 0)
             throw RdException("epoll_ctl");
-
-        if (_callpath_cost_enabled && _num_cpus > 1)
-            _cost_consumer_cpu = _num_cpus - 1;
     }
 
     _prev_counters.assign(_num_counters + _num_samplers, 0);
@@ -914,44 +852,6 @@ void Monitor::write_info(std::ofstream& info)
     info << "l1_cache_line_size=" << sysconf(_SC_LEVEL1_DCACHE_LINESIZE) << std::endl;
     info << "main_binary=" << _main_binary_path << std::endl;
 
-    info << "callpath_cost_present=" << (_callpath_cost_enabled ? 1 : 0) << std::endl;
-    if (_callpath_cost_enabled) {
-        uint64_t total_cost_samples = 0;
-        uint64_t total_cost_lost = 0;
-        uint64_t total_cost_invalid = 0;
-
-        info << "callpath_cost_stage=first_stage" << std::endl;
-        info << "callpath_cost_event=cpu-clock" << std::endl;
-        info << "callpath_cost_wakeup=epoll" << std::endl;
-        info << "callpath_cost_attach_scope=monitored_threads" << std::endl;
-        info << "callpath_cost_exclude_kernel=1" << std::endl;
-        info << "callpath_cost_sample_freq=" << _cost_sample_freq << std::endl;
-        info << "callpath_cost_stack_bytes=" << _cost_stack_bytes << std::endl;
-        info << "callpath_cost_ring_pages=" << _cost_ring_pages << std::endl;
-        info << "callpath_cost_consumer_cpu=" << _cost_consumer_cpu << std::endl;
-        info << "callpath_cost_raw_record_bytes=" << sizeof(callpath_cost_raw_record) << std::endl;
-
-        for (int tid : _tids) {
-            auto it = _threads.find(tid);
-            if (it == _threads.end())
-                continue;
-            const thread_state& state = it->second;
-            total_cost_samples += state.cost_samples;
-            total_cost_lost += state.cost_lost_samples;
-            total_cost_invalid += state.cost_invalid_samples;
-            info << "cost_thread=" << state.tid << "\t"
-                 << read_thread_last_cpu_stat(state.tid) << "\t"
-                 << state.cost_samples << "\t"
-                 << state.cost_lost_samples << "\t"
-                 << state.cost_invalid_samples << "\t"
-                 << (_nameprefix + ".t" + std::to_string(state.tid) + ".cost.raw.bin")
-                 << std::endl;
-        }
-        info << "callpath_cost_samples=" << total_cost_samples << std::endl;
-        info << "callpath_cost_lost_samples=" << total_cost_lost << std::endl;
-        info << "callpath_cost_invalid_samples=" << total_cost_invalid << std::endl;
-    }
-
     if (_num_samplers > 0) {
         info << "sample_record_bytes=" << sample_record_bytes() << std::endl;
         info << "sample_record_fields=" << sample_record_fields() << std::endl;
@@ -1199,13 +1099,6 @@ thread_state& Monitor::register_thread_locked(int tid)
     if (state.active)
         return state;
 
-    state.cost_fd = -1;
-    state.cost_output_fd = -1;
-    state.cost_mmap_base = nullptr;
-    state.cost_mmap_len = 0;
-    state.cost_data_size = 0;
-    state.cost_epoll_registered = false;
-
     try {
         open_thread_locked(state);
         state.active = true;
@@ -1240,19 +1133,6 @@ void Monitor::open_thread_locked(thread_state& state)
     } else {
         state.counter_fds.clear();
     }
-
-    state.cost_fd = -1;
-    state.cost_output_fd = -1;
-    state.cost_mmap_base = nullptr;
-    state.cost_mmap_len = 0;
-    state.cost_data_size = 0;
-    state.cost_epoll_registered = false;
-    state.cost_samples = 0;
-    state.cost_lost_samples = 0;
-    state.cost_invalid_samples = 0;
-
-    if (_callpath_cost_enabled)
-        setup_cost_sampler_locked(state);
 
     if (_num_samplers == 0)
         return;
@@ -1350,8 +1230,6 @@ void Monitor::enable_thread_locked(thread_state& state)
         if (slot.fd >= 0)
             ioctl(slot.fd, PERF_EVENT_IOC_ENABLE, 0);
     }
-    if (state.cost_fd >= 0)
-        ioctl(state.cost_fd, PERF_EVENT_IOC_ENABLE, 0);
 }
 
 /** @brief disable 一个线程上的全部 perf 事件。 */
@@ -1364,10 +1242,6 @@ void Monitor::disable_thread_locked(thread_state& state)
     for (auto& slot : state.samplers) {
         if (slot.fd >= 0)
             ioctl(slot.fd, PERF_EVENT_IOC_DISABLE, 0);
-    }
-    if (state.cost_fd >= 0) {
-        ioctl(state.cost_fd, PERF_EVENT_IOC_DISABLE, 0);
-        consume_cost_samples_locked(state);
     }
 }
 
@@ -1393,8 +1267,6 @@ void Monitor::accumulate_retired_counts_locked(thread_state& state)
         _retired_time_running[index] += count.time_running;
     }
 
-    if (state.cost_fd >= 0)
-        consume_cost_samples_locked(state);
 }
 
 /** @brief 关闭并回收一个线程上的所有 perf fd 与映射。 */
@@ -1421,7 +1293,6 @@ void Monitor::close_thread_locked(thread_state& state)
             close(fd);
     }
     state.counter_fds.clear();
-    teardown_cost_sampler_locked(state);
     state.active = false;
 }
 
@@ -1440,202 +1311,6 @@ void Monitor::unregister_thread_locked(int tid)
 
     accumulate_retired_counts_locked(*state);
     close_thread_locked(*state);
-}
-
-/** @brief 为一个线程创建 disabled 状态的 cpu-clock 调用栈 cost sampler。 */
-void Monitor::setup_cost_sampler_locked(thread_state& state)
-{
-    if (!_callpath_cost_enabled)
-        return;
-
-    struct perf_event_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.type = PERF_TYPE_SOFTWARE;
-    attr.size = sizeof(attr);
-    attr.config = PERF_COUNT_SW_CPU_CLOCK;
-    attr.disabled = 1;
-    attr.freq = 1;
-    attr.sample_freq = _cost_sample_freq;
-    attr.sample_type = PERF_SAMPLE_IP | PERF_SAMPLE_TID | PERF_SAMPLE_TIME |
-        PERF_SAMPLE_CPU | PERF_SAMPLE_REGS_USER | PERF_SAMPLE_STACK_USER;
-    attr.sample_regs_user = ARM64_USER_REGS_MASK;
-    attr.sample_stack_user = _cost_stack_bytes;
-    attr.exclude_kernel = 1;
-    attr.exclude_hv = 1;
-    attr.inherit = 0;
-    attr.wakeup_events = 8;
-
-    int fd = perf_event_open_sys(&attr, state.tid, -1, -1, PERF_FLAG_FD_CLOEXEC);
-    if (fd < 0)
-        throw RdException(std::string("perf_event_open cpu-clock cost sampler failed: ") + strerror(errno));
-
-    size_t mmap_len = (size_t)(_cost_ring_pages + 1) * (size_t)PAGE_SIZE;
-    void *base = mmap(nullptr, mmap_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (base == MAP_FAILED) {
-        close(fd);
-        throw RdException(std::string("mmap cpu-clock cost ring failed: ") + strerror(errno));
-    }
-
-    std::string raw_path = _nameprefix + ".t" + std::to_string(state.tid) + ".cost.raw.bin";
-    int out_fd = open(raw_path.c_str(), O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
-    if (out_fd < 0) {
-        munmap(base, mmap_len);
-        close(fd);
-        throw RdException("cannot open " + raw_path);
-    }
-
-    state.cost_fd = fd;
-    state.cost_output_fd = out_fd;
-    state.cost_mmap_base = base;
-    state.cost_mmap_len = mmap_len;
-    state.cost_data_size = (size_t)_cost_ring_pages * (size_t)PAGE_SIZE;
-    state.cost_samples = 0;
-    state.cost_lost_samples = 0;
-    state.cost_invalid_samples = 0;
-    register_cost_fd_epoll_locked(state);
-}
-
-/** @brief 将线程 cost fd 加入 Monitor 后台 epoll。 */
-void Monitor::register_cost_fd_epoll_locked(thread_state& state)
-{
-    if (!_callpath_cost_enabled || _epoll_fd < 0 || state.cost_fd < 0 || state.cost_epoll_registered)
-        return;
-
-    epoll_event ev = {};
-    ev.events = EPOLLIN | EPOLLERR | EPOLLHUP;
-    ev.data.u64 = make_cost_token((uint32_t)state.cost_fd);
-    if (epoll_ctl(_epoll_fd, EPOLL_CTL_ADD, state.cost_fd, &ev) < 0)
-        throw RdException(std::string("epoll_ctl ADD first-stage cost fd failed: ") + strerror(errno));
-    _cost_fd_to_tid[state.cost_fd] = state.tid;
-    state.cost_epoll_registered = true;
-}
-
-/** @brief 将线程 cost fd 从 Monitor 后台 epoll 删除。 */
-void Monitor::unregister_cost_fd_epoll_locked(thread_state& state)
-{
-    if (!_callpath_cost_enabled || _epoll_fd < 0 || state.cost_fd < 0 || !state.cost_epoll_registered)
-        return;
-
-    if (epoll_ctl(_epoll_fd, EPOLL_CTL_DEL, state.cost_fd, nullptr) < 0 && errno != EBADF && errno != ENOENT)
-        throw RdException(std::string("epoll_ctl DEL first-stage cost fd failed: ") + strerror(errno));
-    _cost_fd_to_tid.erase(state.cost_fd);
-    state.cost_epoll_registered = false;
-}
-
-/** @brief drain 并解析一个线程的 cpu-clock perf ring。 */
-void Monitor::consume_cost_samples_locked(thread_state& state)
-{
-    if (!_callpath_cost_enabled || state.cost_fd < 0 || !state.cost_mmap_base)
-        return;
-
-    perf_event_mmap_page *meta = (perf_event_mmap_page *)state.cost_mmap_base;
-    uint8_t *data = (uint8_t *)state.cost_mmap_base + PAGE_SIZE;
-    uint64_t head = meta->data_head;
-    __sync_synchronize();
-    uint64_t tail = meta->data_tail;
-
-    while (tail < head) {
-        perf_event_header hdr;
-        perf_ring_copy(data, state.cost_data_size, tail, &hdr, sizeof(hdr));
-        if (hdr.size < sizeof(hdr) || tail + hdr.size > head) {
-            state.cost_invalid_samples++;
-            tail = head;
-            break;
-        }
-
-        std::vector<uint8_t> rec(hdr.size);
-        perf_ring_copy(data, state.cost_data_size, tail, rec.data(), rec.size());
-
-        if (hdr.type == PERF_RECORD_LOST) {
-            if (hdr.size >= sizeof(hdr) + 2 * sizeof(uint64_t)) {
-                uint64_t lost = 0;
-                memcpy(&lost, rec.data() + sizeof(hdr) + sizeof(uint64_t), sizeof(lost));
-                state.cost_lost_samples += lost;
-            } else {
-                state.cost_invalid_samples++;
-            }
-        } else if (hdr.type == PERF_RECORD_SAMPLE) {
-            size_t off = sizeof(hdr);
-            callpath_cost_raw_record out = {};
-            out.magic = COST_RAW_MAGIC;
-            out.version = COST_RAW_VERSION;
-            out.header_size = sizeof(out);
-            out.regs_mask = ARM64_USER_REGS_MASK;
-
-            uint32_t pid = 0;
-            uint32_t reserved = 0;
-            uint64_t abi = 0;
-            uint64_t stack_size = 0;
-            uint64_t dyn_stack_size = 0;
-            bool ok = true;
-
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.ip);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, pid);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.tid);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.time);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, out.cpu);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, reserved);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, abi);
-            for (uint32_t i = 0; ok && i < PERF_REG_ARM64_MAX; i++)
-                ok = ok && read_sample_field(rec.data(), rec.size(), off, out.regs[i]);
-            ok = ok && read_sample_field(rec.data(), rec.size(), off, stack_size);
-            if (ok) {
-                uint64_t copy_size = std::min<uint64_t>(stack_size, sizeof(out.stack));
-                if (off + stack_size + sizeof(uint64_t) <= rec.size()) {
-                    memcpy(out.stack, rec.data() + off, copy_size);
-                    out.stack_size = (uint32_t)copy_size;
-                    off += (size_t)stack_size;
-                    ok = ok && read_sample_field(rec.data(), rec.size(), off, dyn_stack_size);
-                    out.dyn_stack_size = (uint32_t)std::min<uint64_t>(dyn_stack_size, UINT32_MAX);
-                } else {
-                    ok = false;
-                }
-            }
-
-            if (ok && out.tid == (uint32_t)state.tid) {
-                ssize_t wrote = write(state.cost_output_fd, &out, sizeof(out));
-                if (wrote == (ssize_t)sizeof(out))
-                    state.cost_samples++;
-                else
-                    state.cost_invalid_samples++;
-            } else {
-                state.cost_invalid_samples++;
-            }
-            (void)pid;
-            (void)reserved;
-            (void)abi;
-        }
-
-        tail += hdr.size;
-    }
-
-    meta->data_tail = tail;
-    __sync_synchronize();
-}
-
-/** @brief 回收一个线程的第一阶段 cost sampler。 */
-void Monitor::teardown_cost_sampler_locked(thread_state& state)
-{
-    if (!_callpath_cost_enabled)
-        return;
-
-    if (state.cost_fd >= 0)
-        ioctl(state.cost_fd, PERF_EVENT_IOC_DISABLE, 0);
-    unregister_cost_fd_epoll_locked(state);
-    consume_cost_samples_locked(state);
-    if (state.cost_mmap_base && state.cost_mmap_base != MAP_FAILED)
-        munmap(state.cost_mmap_base, state.cost_mmap_len);
-    if (state.cost_fd >= 0)
-        close(state.cost_fd);
-    if (state.cost_output_fd >= 0)
-        close(state.cost_output_fd);
-
-    state.cost_fd = -1;
-    state.cost_output_fd = -1;
-    state.cost_mmap_base = nullptr;
-    state.cost_mmap_len = 0;
-    state.cost_data_size = 0;
-    state.cost_epoll_registered = false;
 }
 
 /** @brief 注册当前线程，并在需要时立即 enable。 */
@@ -1670,14 +1345,6 @@ void Monitor::unregister_current_thread()
 void Monitor::run_sampler_thread()
 {
     int64_t tid = gettid();
-    if (_callpath_cost_enabled && _cost_consumer_cpu >= 0) {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(_cost_consumer_cpu, &set);
-        if (sched_setaffinity((pid_t)tid, sizeof(set), &set) < 0)
-            std::cerr << "warning: failed to pin first-stage cost consumer to CPU "
-                      << _cost_consumer_cpu << ": " << strerror(errno) << std::endl;
-    }
     if (write(_event_fd, &tid, sizeof(tid)) != (ssize_t)sizeof(tid))
         throw RdException("eventfd write failed");
 
@@ -1705,8 +1372,6 @@ void Monitor::run_sampler_thread()
                 uint32_t value = (uint32_t)(token & 0xffffffffU);
                 if (kind == SAMPLER_TOKEN_KIND)
                     process_samples((int)value);
-                else if (kind == COST_TOKEN_KIND)
-                    process_cost_samples((int)value);
             }
         }
 
@@ -1719,7 +1384,6 @@ drain:
                     continue;
                 for (auto& slot : kv.second.samplers)
                     extra_samples += process_samples_locked(slot);
-                consume_cost_samples_locked(kv.second);
             }
         }
 
@@ -1740,19 +1404,6 @@ size_t Monitor::process_samples(int slot_id)
     if (it == _sampler_slots.end() || !it->second)
         return 0;
     return process_samples_locked(*it->second);
-}
-
-/** @brief 通过 cost fd 路由到对应线程并 drain cpu-clock ring。 */
-void Monitor::process_cost_samples(int fd)
-{
-    std::lock_guard<std::mutex> lock(_state_mutex);
-    auto it = _cost_fd_to_tid.find(fd);
-    if (it == _cost_fd_to_tid.end())
-        return;
-    thread_state *state = find_thread_locked(it->second);
-    if (!state || !state->active)
-        return;
-    consume_cost_samples_locked(*state);
 }
 
 /**
@@ -1967,8 +1618,6 @@ void Monitor::fds_ioctl(int request)
             if (slot.fd >= 0)
                 ioctl(slot.fd, request, 0);
         }
-        if (kv.second.cost_fd >= 0)
-            ioctl(kv.second.cost_fd, request, 0);
     }
 }
 

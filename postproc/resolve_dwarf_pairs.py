@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import json
+import re
 import subprocess
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     from elftools.elf.elffile import ELFFile
@@ -17,9 +19,14 @@ try:
 except ImportError as exc:
     raise SystemExit("resolve_dwarf_pairs.py requires pyelftools") from exc
 
+from rd_format import format_rd_bucket
+
 
 RD_WPCTL_LOG2_BUCKETS = 64
 RD_WPCTL_MAX_DWARF_STACK_BYTES = 8192
+HEADER_SUFFIXES = {".h", ".hh", ".hpp", ".hxx"}
+FORTRAN_SUFFIXES = {".f", ".F", ".for", ".FOR", ".f90", ".F90", ".f95", ".F95"}
+SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".C"} | HEADER_SUFFIXES | FORTRAN_SUFFIXES
 
 
 @dataclass(frozen=True)
@@ -79,6 +86,50 @@ def parse_info(path: Path) -> Dict[str, str]:
                 k, v = line.split("=", 1)
                 out[k] = v
     return out
+
+
+def normalize_path(path: str | Path) -> str:
+    if not path:
+        return ""
+    try:
+        return str(Path(path).expanduser().resolve())
+    except OSError:
+        return str(Path(path).expanduser())
+
+
+def display_source_path(path: str | Path) -> str:
+    """Shorten normal source files while preserving external/header identity."""
+    if not path:
+        return ""
+    text = str(path)
+    if text in ("??", "??:?", "??:0"):
+        return text
+    p = Path(text)
+    if p.suffix in HEADER_SUFFIXES:
+        return normalize_path(p)
+    if p.suffix in SOURCE_SUFFIXES:
+        return p.name
+    return normalize_path(p)
+
+
+def display_artifact_path(path: str | Path) -> str:
+    """Return a compact path for report metadata."""
+    if not path:
+        return ""
+    p = Path(path)
+    try:
+        return str(p.resolve().relative_to(Path.cwd().resolve()))
+    except Exception:
+        return p.name
+
+
+def display_module_path(path: str) -> str:
+    """Show external DSOs by module name, not by full filesystem path."""
+    if not path:
+        return "external"
+    if path.startswith("["):
+        return path
+    return Path(path).name
 
 
 def load_bias_from_info(path: Path) -> int:
@@ -344,9 +395,23 @@ def symbolize_chain(
 
         symbols = symbol_cache.setdefault(module_path, load_function_symbols(module_path))
         function = nearest_symbol_name(symbols, module_offset) or "unknown procedure"
-        module_name = Path(module_path).name if module_path else "external"
-        frames.append((ip, f"{function} [{module_name}] at 0x{module_offset:x} ({module_name} + 0x{module_offset:x})"))
+        module_label = display_module_path(module_path)
+        frames.append((ip, f"{function} [{module_label}] at 0x{module_offset:x} ({module_label} + 0x{module_offset:x})"))
     return frames
+
+
+def display_frame_text(text: str) -> str:
+    frame = parse_frame_text(text)
+    function = str(frame.get("function", "")) or text
+    module = str(frame.get("module", ""))
+    source = str(frame.get("source", ""))
+    line = int(frame.get("line", 0) or 0)
+    if module:
+        return f"{function} [{module}]"
+    if source and line:
+        loc = display_source_path(source)
+        return f"{function}@{loc}:{line}"
+    return text
 
 
 def render_call_tree(frames: List[Tuple[int, str]], hit_label: str, hit_pc: int) -> List[str]:
@@ -360,13 +425,88 @@ def render_call_tree(frames: List[Tuple[int, str]], hit_label: str, hit_pc: int)
     lines: List[str] = []
     for depth, (ip, text) in enumerate(root_to_leaf):
         is_hit = ip == hit_pc or depth == len(root_to_leaf) - 1
+        label = display_frame_text(text)
         if depth == 0:
             prefix = ""
         else:
             prefix = "    " * (depth - 1) + "`-- "
         suffix = f"  [{hit_label} pc=0x{hit_pc:x}]" if is_hit else ""
-        lines.append(f"{prefix}{text} (0x{ip:x}){suffix}")
+        lines.append(f"{prefix}{label} (0x{ip:x}){suffix}")
     return lines
+
+
+def parse_frame_text(text: str) -> Dict[str, Any]:
+    """Best-effort parser for addr2line/DSO frame text."""
+    frame: Dict[str, Any] = {
+        "text": text,
+        "function": text,
+        "module": "",
+        "source": "",
+        "display_source": "",
+        "line": 0,
+    }
+    dso_match = re.match(r"^(?P<fn>.*?) \[(?P<module>[^\]]+)\] at 0x[0-9a-fA-F]+", text)
+    if dso_match:
+        frame["function"] = dso_match.group("fn").strip() or "unknown procedure"
+        frame["module"] = dso_match.group("module").strip()
+        return frame
+
+    if "@" in text:
+        fn, loc = text.split("@", 1)
+        frame["function"] = fn.strip() or "??"
+        loc = loc.strip()
+        loc = loc.split(" (discriminator", 1)[0]
+        loc_match = re.match(r"^(?P<source>.*):(?P<line>\d+)(?::\d+)?$", loc)
+        if loc_match:
+            frame["source"] = loc_match.group("source")
+            frame["line"] = int(loc_match.group("line"))
+            frame["display_source"] = display_source_path(frame["source"])
+        else:
+            frame["source"] = loc
+            frame["display_source"] = display_source_path(frame["source"])
+        return frame
+
+    return frame
+
+
+def frames_to_json(frames: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for ip, text in frames:
+        item = parse_frame_text(text)
+        item["ip"] = f"0x{ip:x}"
+        out.append(item)
+    return out
+
+
+def frame_functions(frames: List[Tuple[int, str]]) -> List[str]:
+    return [
+        parse_frame_text(text).get("function", "")
+        for _ip, text in frames
+        if parse_frame_text(text).get("function") not in ("", "??")
+    ]
+
+
+def bucket_index_from_bounds(lo: int, hi: int) -> int:
+    if lo == 0 and hi == 0:
+        return 0
+    if lo == 1 and hi == 1:
+        return 1
+    return lo.bit_length()
+
+
+def format_bucket_list(buckets: Sequence[Dict[str, int]]) -> str:
+    return ", ".join(
+        f"{format_rd_bucket((bucket['bucket_lo'], bucket['bucket_hi']))}={bucket['count']}"
+        for bucket in buckets
+    )
+
+
+def write_context_tree(out, title: str, frames: List[Tuple[int, str]], hit_label: str, hit_pc: int) -> None:
+    out.write(f"{title}\n\n")
+    out.write("```text\n")
+    for line in render_call_tree(frames, hit_label, hit_pc):
+        out.write(line + "\n")
+    out.write("```\n\n")
 
 
 def chain_key(chain: List[int]) -> Tuple[int, ...]:
@@ -388,7 +528,11 @@ def main() -> int:
     parser.add_argument("--raw", required=True, nargs="+", type=Path)
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--output-prefix", type=Path)
-    parser.add_argument("--top", type=int, default=20)
+    parser.add_argument("--top", type=int, default=20, help="Backward-compatible alias for --top-contexts")
+    parser.add_argument("--top-contexts", type=int, default=None)
+    parser.add_argument("--long-rd-min-bucket", type=int, default=16)
+    parser.add_argument("--min-count", type=int, default=1)
+    parser.add_argument("--min-long-rd-ratio", type=float, default=0.0)
     args = parser.parse_args()
 
     info = parse_info(args.info)
@@ -418,6 +562,7 @@ def main() -> int:
 
         hist_path = Path(str(prefix) + ".dwarf.pair_context.hist.log2.txt")
         report_path = Path(str(prefix) + ".dwarf.long_rd.report.md")
+        json_path = Path(str(prefix) + ".dwarf.long_rd.report.json")
         hist_path.parent.mkdir(parents=True, exist_ok=True)
         with hist_path.open("w") as out:
             out.write("seed_chain\treuse_chain\tseed_pc_offset\treuse_pc\tbucket_lo\tbucket_hi\tcount\n")
@@ -427,42 +572,116 @@ def main() -> int:
                 for (lo, hi), count in sorted(buckets.items()):
                     out.write(f"{seed_text}\t{reuse_text}\t0x{seed_off:x}\t0x{reuse_pc:x}\t{lo}\t{hi}\t{count}\n")
 
-        ranked = sorted(grouped.items(), key=lambda item: sum(item[1].values()), reverse=True)
+        entries: List[Dict[str, Any]] = []
+        for entry_id, ((seed_chain, seed_off, reuse_chain, reuse_pc), bucket_map) in enumerate(grouped.items(), 1):
+            seed_frames = symbolize_chain(binary, load_bias, main_size, modules, seed_chain)
+            reuse_frames = symbolize_chain(binary, load_bias, main_size, modules, reuse_chain)
+            buckets_json: List[Dict[str, int]] = []
+            total_count = 0
+            long_rd_count = 0
+            top_bucket: Optional[Dict[str, int]] = None
+            for (lo, hi), count in sorted(bucket_map.items()):
+                bucket_index = bucket_index_from_bounds(lo, hi)
+                item = {
+                    "bucket_index": bucket_index,
+                    "bucket_lo": lo,
+                    "bucket_hi": hi,
+                    "count": count,
+                }
+                buckets_json.append(item)
+                total_count += count
+                if bucket_index >= args.long_rd_min_bucket:
+                    long_rd_count += count
+                if top_bucket is None or count > top_bucket["count"]:
+                    top_bucket = item
+            long_rd_ratio = (long_rd_count / total_count) if total_count else 0.0
+            entries.append(
+                {
+                    "entry_id": entry_id,
+                    "seed_chain_ips": [f"0x{x:x}" for x in seed_chain],
+                    "reuse_chain_ips": [f"0x{x:x}" for x in reuse_chain],
+                    "seed_pc_offset": f"0x{seed_off:x}",
+                    "reuse_pc": f"0x{reuse_pc:x}",
+                    "seed_frames": frames_to_json(seed_frames),
+                    "reuse_frames": frames_to_json(reuse_frames),
+                    "seed_functions_leaf_to_root": frame_functions(seed_frames),
+                    "reuse_functions_leaf_to_root": frame_functions(reuse_frames),
+                    "buckets": buckets_json,
+                    "total_count": total_count,
+                    "long_rd_count": long_rd_count,
+                    "long_rd_ratio": long_rd_ratio,
+                    "top_bucket": top_bucket or {},
+                }
+            )
+
+        entries.sort(
+            key=lambda item: (
+                item["long_rd_count"],
+                item["total_count"],
+                item["long_rd_ratio"],
+            ),
+            reverse=True,
+        )
+
+        with json_path.open("w") as out:
+            json.dump(
+                {
+                    "info": str(args.info),
+                    "module_info": str(module_info),
+                    "binary": str(binary),
+                    "events": len(events),
+                    "groups": len(grouped),
+                    "long_rd_min_bucket": args.long_rd_min_bucket,
+                    "entries": entries,
+                },
+                out,
+                indent=2,
+            )
+
+        top_limit = args.top_contexts if args.top_contexts is not None else args.top
+        display_entries = [
+            entry
+            for entry in entries
+            if entry["total_count"] >= args.min_count and entry["long_rd_ratio"] >= args.min_long_rd_ratio
+        ]
         with report_path.open("w") as out:
-            out.write("# DWARF Use-Reuse Calling Context Report\n\n")
+            out.write("# DWARF Use-Reuse Pair Context Report\n\n")
             out.write(f"- events: {len(events)}\n")
             out.write(f"- groups: {len(grouped)}\n\n")
-            out.write(f"- module_map_source: `{module_info}`\n")
+            out.write(f"- module_map_source: `{display_artifact_path(module_info)}`\n")
             out.write(f"- module_map_entries: `{len(modules)}`\n\n")
-            for rank, ((seed_chain, seed_off, reuse_chain, reuse_pc), buckets) in enumerate(ranked[: args.top], 1):
-                out.write(f"## Pair {rank}\n\n")
-                out.write(f"- seed_pc_offset: `0x{seed_off:x}`\n")
-                out.write(f"- reuse_pc: `0x{reuse_pc:x}`\n")
-                out.write(f"- count: `{sum(buckets.values())}`\n")
-                out.write("- buckets: " + ", ".join(f"[{lo},{hi}]={c}" for (lo, hi), c in sorted(buckets.items())) + "\n\n")
-                out.write("Use-side calling context tree:\n\n")
-                out.write("```text\n")
-                seed_frames = symbolize_chain(binary, load_bias, main_size, modules, seed_chain)
-                for line in render_call_tree(seed_frames, "USE HIT", seed_chain[0] if seed_chain else 0):
-                    out.write(line + "\n")
-                out.write("```\n\n")
 
-                out.write("Reuse-side calling context tree:\n\n")
-                out.write("```text\n")
-                reuse_frames = symbolize_chain(binary, load_bias, main_size, modules, reuse_chain)
-                for line in render_call_tree(reuse_frames, "REUSE HIT", reuse_chain[0] if reuse_chain else 0):
-                    out.write(line + "\n")
-                out.write("```\n\n")
+            for rank, entry in enumerate(display_entries[:top_limit], 1):
+                out.write(f"## Pair Context {rank}\n\n")
+                out.write(f"- entry_id: `{entry['entry_id']}`\n")
+                out.write(f"- seed_pc_offset: `{entry['seed_pc_offset']}`\n")
+                out.write(f"- reuse_pc: `{entry['reuse_pc']}`\n")
+                out.write(f"- total_count: `{entry['total_count']}`\n")
+                out.write("\n")
 
-                out.write("Leaf-to-root summary:\n\n")
-                out.write("- use: " + " <- ".join(text for _ip, text in seed_frames) + "\n")
-                out.write("- reuse: " + " <- ".join(text for _ip, text in reuse_frames) + "\n")
+                seed_frames = [(int(frame["ip"], 16), frame["text"]) for frame in entry["seed_frames"]]
+                reuse_frames = [(int(frame["ip"], 16), frame["text"]) for frame in entry["reuse_frames"]]
+                seed_hit_pc = int(entry["seed_chain_ips"][0], 16) if entry["seed_chain_ips"] else 0
+                reuse_hit_pc = int(entry["reuse_chain_ips"][0], 16) if entry["reuse_chain_ips"] else 0
+                write_context_tree(out, "Use-side context:", seed_frames, "USE HIT", seed_hit_pc)
+                write_context_tree(out, "Reuse-side context:", reuse_frames, "REUSE HIT", reuse_hit_pc)
+
+                out.write("RD buckets:\n\n")
+                out.write("| bucket | count | ratio |\n")
+                out.write("| --- | ---: | ---: |\n")
+                for bucket in entry["buckets"]:
+                    ratio = bucket["count"] / entry["total_count"] if entry["total_count"] else 0.0
+                    label = format_rd_bucket((bucket["bucket_lo"], bucket["bucket_hi"]))
+                    out.write(
+                        f"| {label} | {bucket['count']} | {ratio:.6f} |\n"
+                    )
                 out.write("\n")
     finally:
         unwinder.close()
 
     print(f"wrote {hist_path}")
     print(f"wrote {report_path}")
+    print(f"wrote {json_path}")
     return 0
 
 
