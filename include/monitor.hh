@@ -56,6 +56,7 @@
 #define SPE_SAMPLE_FLAG_LAT_XLAT_VALID (1ULL << 3)
 #define SPE_SAMPLE_FLAG_EVENTS_VALID (1ULL << 4)
 #define SPE_SAMPLE_FLAG_LAT_EXEC_VALID (1ULL << 5)
+#define SPE_SAMPLE_FLAG_DATA_VA_VALID (1ULL << 6)
 
 /**
  * @brief 描述一组 perf 事件的规格。
@@ -180,12 +181,13 @@ struct hotspot_summary
 /**
  * @brief ARM SPE 第一阶段落盘的指令级样本记录。
  *
- * 该格式不再保存 data VA 和 timestamp，只保存当前 sampled instruction
- * 的 PC、latency counter、event packet 和有效性标记。
+ * 该格式不再保存 timestamp；保存当前 sampled instruction 的 PC、
+ * data VA、latency counter、event packet 和有效性标记。
  */
 struct spe_instruction_sample
 {
     uint64_t pc;
+    uint64_t data_va;
     uint64_t lat_total;
     uint64_t lat_issue;
     uint64_t lat_xlat;
@@ -257,8 +259,8 @@ private:
  * @brief 表示一个 sampler fd 及其映射缓冲区。
  *
  * 对于 ARM SPE，`pending_*` 字段用于跨 packet 拼接一条 sampled
- * instruction 的 `pc + latency + event_bits`，遇到 time/end packet 后
- * flush 到 `.sample0`。
+ * instruction 的 `pc + data_va + latency + event_bits`，遇到 time/end
+ * packet 后 flush 到 `.sample0`。
  */
 struct sampler_slot
 {
@@ -271,6 +273,7 @@ struct sampler_slot
     void *auxbuf;
     size_t auxbuf_bytes;
     uint64_t pending_pc;
+    uint64_t pending_data_va;
     uint64_t pending_lat_total;
     uint64_t pending_lat_issue;
     uint64_t pending_lat_xlat;

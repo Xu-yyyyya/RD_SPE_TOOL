@@ -444,7 +444,7 @@ size_t Monitor::sample_record_bytes() const
 /** @brief 返回当前样本记录的字段顺序描述。 */
 const char *Monitor::sample_record_fields() const
 {
-    return has_arm_spe_samples() ? "pc,lat_total,lat_issue,lat_xlat,event_bits,flags" : "time,addr";
+    return has_arm_spe_samples() ? "pc,data_va,lat_total,lat_issue,lat_xlat,event_bits,flags" : "time,addr";
 }
 
 /** @brief 判断样本记录中是否显式携带 PC。 */
@@ -635,6 +635,7 @@ void Monitor::record_hotspot_sample(int tid, const spe_instruction_sample& sampl
 void Monitor::reset_pending_spe_sample(sampler_slot& slot) const
 {
     slot.pending_pc = 0;
+    slot.pending_data_va = 0;
     slot.pending_lat_total = 0;
     slot.pending_lat_issue = 0;
     slot.pending_lat_xlat = 0;
@@ -642,7 +643,7 @@ void Monitor::reset_pending_spe_sample(sampler_slot& slot) const
     slot.pending_flags = 0;
 }
 
-/** @brief 将 pending SPE 状态写出为一条 48 字节指令级样本。 */
+/** @brief 将 pending SPE 状态写出为一条固定结构的指令级样本。 */
 bool Monitor::flush_pending_spe_sample_locked(sampler_slot& slot, BinaryWriter& writer, size_t& num_samples,
     bool from_end_packet)
 {
@@ -654,6 +655,7 @@ bool Monitor::flush_pending_spe_sample_locked(sampler_slot& slot, BinaryWriter& 
 
     spe_instruction_sample sample = {};
     sample.pc = slot.pending_pc;
+    sample.data_va = slot.pending_data_va;
     sample.lat_total = slot.pending_lat_total;
     sample.lat_issue = slot.pending_lat_issue;
     sample.lat_xlat = slot.pending_lat_xlat;
@@ -857,11 +859,11 @@ void Monitor::write_info(std::ofstream& info)
         info << "sample_record_fields=" << sample_record_fields() << std::endl;
         info << "sample_pc_present=" << (sample_pc_present() ? 1 : 0) << std::endl;
         if (has_arm_spe_samples()) {
-            info << "sample_data_va_present=0" << std::endl;
+            info << "sample_data_va_present=1" << std::endl;
             info << "sample_time_present=0" << std::endl;
             info << "spe_time_packet_used_as_record_end=1" << std::endl;
             info << "spe_end_packet_used_as_record_end=1" << std::endl;
-            info << "spe_sample_flags=pc_valid,lat_total_valid,lat_issue_valid,lat_xlat_valid,events_valid,lat_exec_valid" << std::endl;
+            info << "spe_sample_flags=pc_valid,lat_total_valid,lat_issue_valid,lat_xlat_valid,events_valid,lat_exec_valid,data_va_valid" << std::endl;
         }
     }
 
@@ -1411,7 +1413,7 @@ size_t Monitor::process_samples(int slot_id)
  *
  * 普通 `PERF_RECORD_SAMPLE` 直接写出 `time,addr`；
  * ARM SPE `PERF_RECORD_AUX` 则逐 packet 解码，并在 time/end packet 处
- * 写出当前 sampled instruction 的 `pc + latency + event_bits + flags`。
+ * 写出当前 sampled instruction 的 `pc + data_va + latency + event_bits + flags`。
  */
 size_t Monitor::process_samples_locked(sampler_slot& slot)
 {
@@ -1518,6 +1520,9 @@ size_t Monitor::process_samples_locked(sampler_slot& slot)
                         if (addr_index == SPE_ADDR_PKT_HDR_INDEX_INS) {
                             slot.pending_pc = decoded_addr;
                             slot.pending_flags |= SPE_SAMPLE_FLAG_PC_VALID;
+                        } else if (addr_index == SPE_ADDR_PKT_HDR_INDEX_DATA_VIRT) {
+                            slot.pending_data_va = decoded_addr;
+                            slot.pending_flags |= SPE_SAMPLE_FLAG_DATA_VA_VALID;
                         }
 
                         spe_packet_payload_size = 8;
